@@ -1,0 +1,49 @@
+# Fichiers et dossiers à ignorer pour ce projet Discord Bot
+
+# Environnements virtuels
+.venv/
+venv/
+
+# Fichiers Python compilés
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Fichiers de logs
+*.log
+
+# Fichiers d'environnement
+.env
+.env.*
+
+# Fichiers de configuration utilisateur
+*.sqlite3
+
+# Dossiers de test ou de build
+build/
+dist/
+
+# Docker
+*.pid
+db_data/
+
+# VS Code
+.vscode/
+
+# Autres fichiers temporaires
+*.swp
+*.bak
+*.tmp
+
+# Node (si jamais utilisé)
+node_modules/
+
+# MacOS
+.DS_Store
+
+# Thumbs.db (Windows)
+Thumbs.db
+
+#  Variables d'environnement
+.env
