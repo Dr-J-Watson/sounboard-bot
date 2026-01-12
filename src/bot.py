@@ -753,11 +753,16 @@ class RoutineCreationView(discord.ui.View):
             # Parse conditions
             self.conditions = []
             self.condition_logic = "AND"
+            self.advanced_logic_expr = None  # Expression logique avancée
             if routine_data['conditions']:
                 c = routine_data['conditions']
-                if c.get('type') in ['AND', 'OR']:
+                if c.get('type') in ['AND', 'OR', 'XOR']:
                     self.condition_logic = c['type']
                     self.conditions = c.get('sub', [])
+                elif c.get('type') == 'EXPR':
+                    # Advanced expression mode
+                    self.advanced_logic_expr = c.get('expr', '')
+                    self.conditions = c.get('conditions', [])
                 else:
                     self.conditions = [c]
         else:
@@ -766,6 +771,7 @@ class RoutineCreationView(discord.ui.View):
             self.conditions = [] 
             self.actions = [] 
             self.condition_logic = "AND"
+            self.advanced_logic_expr = None  # Expression logique avancée (ex: "(C1 ET C2) OU C3")
         
         # UI State
         self.mode = "main" 
@@ -808,15 +814,29 @@ class RoutineCreationView(discord.ui.View):
             # Condition Management
             self.add_item(discord.ui.Button(label="Ajouter Condition", style=discord.ButtonStyle.success, custom_id="add_condition", emoji="➕", row=0))
             
-            # Logic Toggle
-            style = discord.ButtonStyle.primary if self.condition_logic == "AND" else discord.ButtonStyle.secondary
-            label = "Logique: TOUT (AND)" if self.condition_logic == "AND" else "Logique: AU MOINS 1 (OR)"
-            self.add_item(discord.ui.Button(label=label, style=style, custom_id="toggle_logic", row=0))
+            # Logic Toggle (simple mode) - cycles through AND -> OR -> XOR
+            # Disabled when advanced logic is set
+            logic_labels = {
+                "AND": "Logique: TOUT (ET)",
+                "OR": "Logique: AU MOINS 1 (OU)",
+                "XOR": "Logique: UN SEUL (XOR)"
+            }
+            label = logic_labels.get(self.condition_logic, "Logique: ET")
+            toggle_disabled = bool(self.advanced_logic_expr)
+            self.add_item(discord.ui.Button(label=label, style=discord.ButtonStyle.primary, custom_id="toggle_logic", row=0, disabled=toggle_disabled))
+            
+            # Advanced Logic Button - always shown, disabled if < 2 conditions
+            if self.advanced_logic_expr:
+                # Show reset button when advanced mode is active
+                self.add_item(discord.ui.Button(label="Réinitialiser", style=discord.ButtonStyle.danger, custom_id="reset_advanced_logic", emoji="🔄", row=0))
+            else:
+                adv_disabled = len(self.conditions) < 2
+                self.add_item(discord.ui.Button(label="Logique Avancée", style=discord.ButtonStyle.secondary, custom_id="advanced_logic", emoji="🧮", row=0, disabled=adv_disabled))
 
             if self.conditions:
                 options = []
                 for i, c in enumerate(self.conditions):
-                    label = f"{i+1}. {self.format_condition(c)}"
+                    label = f"C{i+1}. {self.format_condition(c)}"
                     options.append(discord.SelectOption(label=label[:100], value=str(i)))
                 
                 self.add_item(discord.ui.Select(placeholder="Sélectionner une condition", custom_id="select_item", options=options, row=1))
@@ -904,7 +924,21 @@ class RoutineCreationView(discord.ui.View):
                 await interaction.response.send_modal(ConditionInputModal(self))
                 return False
             elif cid == "toggle_logic":
-                self.condition_logic = "OR" if self.condition_logic == "AND" else "AND"
+                # Cycle through AND -> OR -> XOR -> AND (only works when not in advanced mode)
+                if not self.advanced_logic_expr:
+                    if self.condition_logic == "AND":
+                        self.condition_logic = "OR"
+                    elif self.condition_logic == "OR":
+                        self.condition_logic = "XOR"
+                    else:
+                        self.condition_logic = "AND"
+            elif cid == "advanced_logic":
+                await self.show_advanced_logic_panel(interaction)
+                return False
+            elif cid == "reset_advanced_logic":
+                # Reset to simple mode with AND as default
+                self.advanced_logic_expr = None
+                self.condition_logic = "AND"
 
             # Action Actions
             elif cid == "add_action_sound":
@@ -961,6 +995,208 @@ class RoutineCreationView(discord.ui.View):
             await self.refresh_embed(interaction)
         return True
 
+    async def show_advanced_logic_panel(self, interaction: discord.Interaction):
+        """Affiche le panel de logique avancée et attend un message de l'utilisateur."""
+        # Build conditions list with diminutives
+        cond_list = ""
+        for i, c in enumerate(self.conditions):
+            cond_list += f"  **C{i+1}** : {self.format_condition(c)}\n"
+        
+        embed = discord.Embed(
+            title="🧮 Mode Conditions Avancées",
+            color=discord.Color.purple()
+        )
+        
+        embed.add_field(
+            name="📋 Vos conditions",
+            value=cond_list or "*Aucune condition*",
+            inline=False
+        )
+        
+        embed.add_field(
+            name="📝 Connecteurs logiques",
+            value=(
+                "• **ET** / **AND** : Les deux doivent être vraies\n"
+                "• **OU** / **OR** : Au moins une doit être vraie\n"
+                "• **XOR** : Exactement une seule vraie\n"
+                "• **NON** / **NOT** : Inverse la condition\n"
+                "• **( )** : Définir les priorités"
+            ),
+            inline=False
+        )
+        
+        embed.add_field(
+            name="💡 Exemples",
+            value=(
+                "`(C1 ET C2) OU C3`\n"
+                "→ Si (user ET time), OU si role\n\n"
+                "`C1 ET (C2 OU C3)`\n"
+                "→ Si user ET (time OU role)\n\n"
+                "`NON C1 ET C2`\n"
+                "→ Si PAS user ET time\n\n"
+                "`C1 XOR C2`\n"
+                "→ Si user OU time mais pas les deux"
+            ),
+            inline=False
+        )
+        
+        current_expr = self.advanced_logic_expr or f"C1 ET C2 ET ... (défaut: {self.condition_logic})"
+        embed.add_field(
+            name="⚙️ Expression actuelle",
+            value=f"`{current_expr}`",
+            inline=False
+        )
+        
+        embed.set_footer(text="⌨️ Envoyez votre expression dans le chat (ou 'annuler' pour revenir)...")
+        
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        
+        # Wait for user message
+        def check(m):
+            return m.author.id == interaction.user.id and m.channel.id == interaction.channel_id
+        
+        try:
+            msg = await self.bot.wait_for('message', timeout=120.0, check=check)
+            
+            # Try to delete the user's message
+            try:
+                await msg.delete()
+            except:
+                pass
+            
+            if msg.content.lower() == 'annuler':
+                await interaction.followup.send("❌ Annulé. Retour au mode simple.", ephemeral=True)
+                return
+            
+            # Parse the expression
+            try:
+                parsed = self.parse_logic_expression(msg.content)
+                self.advanced_logic_expr = msg.content.upper()
+                await interaction.followup.send(f"✅ Expression logique enregistrée : `{self.advanced_logic_expr}`", ephemeral=True)
+            except ValueError as e:
+                await interaction.followup.send(f"❌ Erreur de syntaxe : {e}", ephemeral=True)
+                
+        except asyncio.TimeoutError:
+            await interaction.followup.send("⏰ Temps écoulé. Aucune modification.", ephemeral=True)
+
+    def parse_logic_expression(self, expr: str) -> dict:
+        """
+        Parse une expression logique avec parenthèses et retourne un arbre de conditions.
+        Exemple: "(C1 ET C2) OU C3" -> {"type": "OR", "sub": [{"type": "AND", "sub": [C1, C2]}, C3]}
+        """
+        # Normalize expression
+        expr = expr.upper().strip()
+        expr = expr.replace("AND", " ET ").replace("OR", " OU ").replace("NOT", " NON ")
+        expr = " ".join(expr.split())  # Normalize whitespace
+        
+        # Tokenize
+        tokens = self._tokenize(expr)
+        
+        # Parse with operator precedence: NOT > AND/ET > XOR > OR/OU
+        result, pos = self._parse_or(tokens, 0)
+        
+        if pos < len(tokens):
+            raise ValueError(f"Token inattendu : {tokens[pos]}")
+        
+        return result
+    
+    def _tokenize(self, expr: str) -> list:
+        """Tokenize l'expression en liste de tokens."""
+        tokens = []
+        i = 0
+        while i < len(expr):
+            if expr[i] in '()':
+                tokens.append(expr[i])
+                i += 1
+            elif expr[i] == ' ':
+                i += 1
+            else:
+                # Read word
+                j = i
+                while j < len(expr) and expr[j] not in '() ':
+                    j += 1
+                word = expr[i:j]
+                tokens.append(word)
+                i = j
+        return tokens
+    
+    def _parse_or(self, tokens: list, pos: int) -> tuple:
+        """Parse OR/OU expressions (lowest precedence)."""
+        left, pos = self._parse_xor(tokens, pos)
+        
+        while pos < len(tokens) and tokens[pos] == 'OU':
+            pos += 1  # Skip 'OU'
+            right, pos = self._parse_xor(tokens, pos)
+            left = {"type": "OR", "sub": [left, right]}
+        
+        return left, pos
+    
+    def _parse_xor(self, tokens: list, pos: int) -> tuple:
+        """Parse XOR expressions."""
+        left, pos = self._parse_and(tokens, pos)
+        
+        while pos < len(tokens) and tokens[pos] == 'XOR':
+            pos += 1  # Skip 'XOR'
+            right, pos = self._parse_and(tokens, pos)
+            left = {"type": "XOR", "sub": [left, right]}
+        
+        return left, pos
+    
+    def _parse_and(self, tokens: list, pos: int) -> tuple:
+        """Parse AND/ET expressions."""
+        left, pos = self._parse_not(tokens, pos)
+        
+        while pos < len(tokens) and tokens[pos] == 'ET':
+            pos += 1  # Skip 'ET'
+            right, pos = self._parse_not(tokens, pos)
+            left = {"type": "AND", "sub": [left, right]}
+        
+        return left, pos
+    
+    def _parse_not(self, tokens: list, pos: int) -> tuple:
+        """Parse NOT/NON expressions."""
+        if pos < len(tokens) and tokens[pos] == 'NON':
+            pos += 1  # Skip 'NON'
+            operand, pos = self._parse_not(tokens, pos)  # NOT is right-associative
+            return {"type": "NOT", "sub": [operand]}, pos
+        
+        return self._parse_primary(tokens, pos)
+    
+    def _parse_primary(self, tokens: list, pos: int) -> tuple:
+        """Parse primary expressions (conditions or parenthesized expressions)."""
+        if pos >= len(tokens):
+            raise ValueError("Expression incomplète")
+        
+        token = tokens[pos]
+        
+        if token == '(':
+            pos += 1  # Skip '('
+            result, pos = self._parse_or(tokens, pos)
+            if pos >= len(tokens) or tokens[pos] != ')':
+                raise ValueError("Parenthèse fermante ')' manquante")
+            pos += 1  # Skip ')'
+            return result, pos
+        
+        elif token.startswith('C') and token[1:].isdigit():
+            # Condition reference like C1, C2, etc.
+            idx = int(token[1:]) - 1  # C1 -> index 0
+            if idx < 0 or idx >= len(self.conditions):
+                raise ValueError(f"Condition {token} n'existe pas (max: C{len(self.conditions)})")
+            return self.conditions[idx], pos + 1
+        
+        else:
+            raise ValueError(f"Token invalide : '{token}'. Utilisez C1, C2, etc.")
+
+    def build_condition_tree_from_expr(self) -> dict:
+        """Construit l'arbre de conditions à partir de l'expression avancée ou du mode simple."""
+        if self.advanced_logic_expr:
+            return self.parse_logic_expression(self.advanced_logic_expr)
+        elif len(self.conditions) == 1:
+            return self.conditions[0]
+        elif len(self.conditions) > 1:
+            return {"type": self.condition_logic, "sub": self.conditions}
+        return None
+
     async def refresh_embed(self, interaction: discord.Interaction):
         embed = discord.Embed(title=f"🛠️ {self.name}", color=discord.Color.blue())
         
@@ -973,11 +1209,19 @@ class RoutineCreationView(discord.ui.View):
         for i, t in enumerate(self.triggers):
             desc += f"`{i+1}.` {self.format_trigger(t)}\n"
         
-        # Conditions
-        desc += f"\n**🤔 Conditions ({self.condition_logic})**\n"
-        if not self.conditions: desc += "*Aucune condition*\n"
-        for i, c in enumerate(self.conditions):
-            desc += f"`{i+1}.` {self.format_condition(c)}\n"
+        # Conditions - show with C1, C2, etc. for advanced mode
+        if self.advanced_logic_expr:
+            desc += f"\n**🤔 Conditions (Avancé)**\n"
+            desc += f"*Expression:* `{self.advanced_logic_expr}`\n"
+        else:
+            logic_label = {"AND": "ET", "OR": "OU", "XOR": "XOR"}.get(self.condition_logic, self.condition_logic)
+            desc += f"\n**🤔 Conditions ({logic_label})**\n"
+        
+        if not self.conditions: 
+            desc += "*Aucune condition*\n"
+        else:
+            for i, c in enumerate(self.conditions):
+                desc += f"`C{i+1}.` {self.format_condition(c)}\n"
             
         # Actions
         desc += f"\n**🎬 Actions**\n"
@@ -1000,13 +1244,8 @@ class RoutineCreationView(discord.ui.View):
     async def save_routine(self, interaction: discord.Interaction):
         primary_trigger = self.triggers[0]
         
-        # Compile conditions
-        final_conditions = None
-        if self.conditions:
-            if len(self.conditions) == 1:
-                final_conditions = self.conditions[0]
-            else:
-                final_conditions = {"type": self.condition_logic, "sub": self.conditions}
+        # Compile conditions using advanced expression or simple mode
+        final_conditions = self.build_condition_tree_from_expr()
 
         if self.routine_id:
             await self.db.update_routine(
@@ -1116,6 +1355,50 @@ async def routine_create(interaction: discord.Interaction):
     embed = discord.Embed(title="🧙 Créateur de Routine", description="Chargement...", color=discord.Color.gold())
     await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
     await view.refresh_embed(interaction)
+
+@bot.tree.command(name="routine_cmd", description="Créer une routine via commande textuelle.")
+@app_commands.describe(
+    name="Nom de la routine",
+    command="Commande (ex: timer 30s do play son | on join if user=ID do wait 2s then play bienvenue)"
+)
+async def routine_cmd(interaction: discord.Interaction, name: str, command: str):
+    if not interaction.guild_id: 
+        await interaction.response.send_message("Commande serveur uniquement.", ephemeral=True)
+        return
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("Réservé aux administrateurs.", ephemeral=True)
+        return
+
+    try:
+        trigger_type, trigger_data, conditions, actions = bot.routine_manager.parse_routine_string(command)
+        
+        await db.add_routine(
+            str(interaction.guild_id),
+            name,
+            trigger_type,
+            trigger_data,
+            actions,
+            conditions
+        )
+        await bot.routine_manager.load_routines()
+        
+        # Build confirmation message
+        trigger_desc = f"Timer {trigger_data.get('interval_seconds', trigger_data.get('interval_minutes', 0)*60)}s" if trigger_type == "timer" else f"Event {trigger_data.get('event')}"
+        actions_desc = ", ".join([a.get('sound_name', f"wait {a.get('delay')}s") if a['type'] != 'wait' else f"wait {a.get('delay')}s" for a in actions])
+        
+        embed = discord.Embed(title="✅ Routine créée", color=discord.Color.green())
+        embed.add_field(name="Nom", value=name, inline=True)
+        embed.add_field(name="Trigger", value=trigger_desc, inline=True)
+        embed.add_field(name="Actions", value=actions_desc or "Aucune", inline=False)
+        if conditions:
+            embed.add_field(name="Conditions", value=str(conditions), inline=False)
+        
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        
+    except ValueError as e:
+        await interaction.response.send_message(f"❌ Erreur de syntaxe: {e}", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Erreur: {e}", ephemeral=True)
 
 
 if __name__ == "__main__":

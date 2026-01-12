@@ -6,7 +6,6 @@ import time
 import datetime
 import os
 from typing import List, Dict, Any, Optional
-from discord.ext import tasks
 from config import Config
 
 logger = logging.getLogger(__name__)
@@ -93,6 +92,9 @@ class RoutineManager:
         elif before.channel is not None and after.channel is None:
             event_type = "voice_leave"
             channel = before.channel
+        elif before.channel is not None and after.channel is not None and before.channel.id != after.channel.id:
+            event_type = "voice_move"
+            channel = after.channel
 
         if not event_type:
             return
@@ -119,7 +121,7 @@ class RoutineManager:
         return await self.evaluate_condition_node(conditions, context)
 
     async def evaluate_condition_node(self, node, context) -> bool:
-        # Node structure: {'type': 'AND/OR/NOT', 'sub': [...]} OR {'type': 'user_id', 'op': '==', 'value': '...'}
+        # Node structure: {'type': 'AND/OR/XOR/NOT', 'sub': [...]} OR {'type': 'user_id', 'op': '==', 'value': '...'}
         
         c_type = node.get('type')
         
@@ -134,6 +136,14 @@ class RoutineManager:
                 if await self.evaluate_condition_node(sub, context):
                     return True
             return False
+        
+        elif c_type == 'XOR':
+            # Exactly one must be true
+            true_count = 0
+            for sub in node.get('sub', []):
+                if await self.evaluate_condition_node(sub, context):
+                    true_count += 1
+            return true_count == 1
         
         elif c_type == 'NOT':
             return not await self.evaluate_condition_node(node.get('sub')[0], context)
@@ -161,14 +171,18 @@ class RoutineManager:
                 return False
         elif c_type == 'time_range':
             # Value format: "HH:MM-HH:MM"
-            now = datetime.datetime.now().time()
-            start_str, end_str = value.split('-')
-            start = datetime.datetime.strptime(start_str, "%H:%M").time()
-            end = datetime.datetime.strptime(end_str, "%H:%M").time()
-            if start <= end:
-                return start <= now <= end
-            else: # Crosses midnight
-                return start <= now or now <= end
+            try:
+                now = datetime.datetime.now().time()
+                start_str, end_str = value.split('-')
+                start = datetime.datetime.strptime(start_str.strip(), "%H:%M").time()
+                end = datetime.datetime.strptime(end_str.strip(), "%H:%M").time()
+                if start <= end:
+                    return start <= now <= end
+                else: # Crosses midnight
+                    return start <= now or now <= end
+            except ValueError:
+                logger.error(f"Invalid time_range format: {value}")
+                return False
         elif c_type == 'date_range':
             # Value format: "DD:MM-DD:MM" (or DD/MM)
             now = datetime.datetime.now().date()
@@ -275,11 +289,12 @@ class RoutineManager:
             if len(trigger_tokens) < 2: raise ValueError("Événement manquant (ex: on join).")
             event_map = {
                 "join": "voice_join",
-                "leave": "voice_leave"
+                "leave": "voice_leave",
+                "move": "voice_move"
             }
             evt = trigger_tokens[1]
             if evt not in event_map:
-                raise ValueError(f"Événement inconnu '{evt}'. Utilisez join ou leave.")
+                raise ValueError(f"Événement inconnu '{evt}'. Utilisez join, leave ou move.")
             trigger_type = "event"
             trigger_data['event'] = event_map[evt]
         else:
@@ -308,6 +323,7 @@ class RoutineManager:
                 elif key == "channel": c_type = "channel_id"
                 elif key == "role": c_type = "role_id"
                 elif key == "time": c_type = "time_range"
+                elif key == "date": c_type = "date_range"
                 else:
                     raise ValueError(f"Clé de condition inconnue: {key}")
                 
