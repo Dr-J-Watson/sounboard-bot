@@ -1101,9 +1101,19 @@ class SoundSelectorView(discord.ui.View):
                 next_btn.callback = self.page_next_callback
                 self.add_item(next_btn)
         
+        # Skip button (to skip current sound)
+        skip_btn = discord.ui.Button(
+            label="⏭️ Skip",
+            style=discord.ButtonStyle.primary,
+            custom_id="skip",
+            row=2
+        )
+        skip_btn.callback = self.skip_callback
+        self.add_item(skip_btn)
+        
         # Cancel button
         cancel_btn = discord.ui.Button(
-            label="Annuler",
+            label="Fermer",
             style=discord.ButtonStyle.danger,
             custom_id="cancel",
             row=2
@@ -1216,9 +1226,20 @@ class SoundSelectorView(discord.ui.View):
         self.update_components()
         await interaction.response.edit_message(view=self)
     
+    async def skip_callback(self, interaction: discord.Interaction):
+        """Skip le son en cours."""
+        player = self.bot.player_manager.get_player(self.guild_id)
+        
+        if player.skip():
+            embed = self.build_embed()
+            embed.set_footer(text=f"⏭️ Son passé • Page {self.page + 1}/{((len(self.all_sounds) - 1) // self.sounds_per_page + 1)}")
+            await interaction.response.edit_message(embed=embed, view=self)
+        else:
+            await interaction.response.send_message("ℹ️ Aucun son en cours de lecture.", ephemeral=True)
+    
     async def cancel_callback(self, interaction: discord.Interaction):
-        """Annule la sélection."""
-        await interaction.response.edit_message(content="❌ Sélection annulée.", embed=None, view=None)
+        """Ferme le sélecteur."""
+        await interaction.response.edit_message(content="👋 Menu fermé.", embed=None, view=None)
         self.stop()
     
     async def on_timeout(self):
@@ -1921,9 +1942,23 @@ class RoutineCreationView(discord.ui.View):
 
     def format_trigger(self, t):
         if t['type'] == 'timer':
-            return f"Timer: {t['data'].get('interval_seconds')}s"
+            return f"⏰ Timer: {t['data'].get('interval_seconds')}s"
         elif t['type'] == 'event':
-            return f"Event: {t['data'].get('event')}"
+            event = t['data'].get('event', '')
+            event_labels = {
+                'voice_join': '🟢 Join Vocal',
+                'voice_leave': '🔴 Leave Vocal',
+                'voice_move': '🔀 Move Vocal',
+                'voice_mute': '🔇 Mute',
+                'voice_unmute': '🔊 Unmute',
+                'voice_deafen': '🚫 Deafen',
+                'voice_undeafen': '🎧 Undeafen',
+                'voice_stream_start': '📺 Stream Start',
+                'voice_stream_stop': '📵 Stream Stop',
+                'voice_video_start': '📹 Vidéo Start',
+                'voice_video_stop': '📷 Vidéo Stop'
+            }
+            return f"Event: {event_labels.get(event, event)}"
         return "Inconnu"
 
     def format_condition(self, c):
@@ -1974,8 +2009,17 @@ class RoutineCreationView(discord.ui.View):
             elif cid == "add_event":
                 # Quick select for event
                 self.add_item(discord.ui.Select(placeholder="Choisir l'événement", custom_id="quick_select_event", options=[
-                    discord.SelectOption(label="Join Vocal", value="voice_join"),
-                    discord.SelectOption(label="Leave Vocal", value="voice_leave")
+                    discord.SelectOption(label="🟢 Join Vocal", value="voice_join", description="Quand quelqu'un rejoint un salon"),
+                    discord.SelectOption(label="🔴 Leave Vocal", value="voice_leave", description="Quand quelqu'un quitte un salon"),
+                    discord.SelectOption(label="🔀 Move Vocal", value="voice_move", description="Quand quelqu'un change de salon"),
+                    discord.SelectOption(label="🔇 Mute", value="voice_mute", description="Quand quelqu'un coupe son micro"),
+                    discord.SelectOption(label="🔊 Unmute", value="voice_unmute", description="Quand quelqu'un active son micro"),
+                    discord.SelectOption(label="🚫 Deafen", value="voice_deafen", description="Quand quelqu'un coupe son casque"),
+                    discord.SelectOption(label="🎧 Undeafen", value="voice_undeafen", description="Quand quelqu'un active son casque"),
+                    discord.SelectOption(label="📺 Stream Start", value="voice_stream_start", description="Quand quelqu'un lance un stream"),
+                    discord.SelectOption(label="📵 Stream Stop", value="voice_stream_stop", description="Quand quelqu'un arrête son stream"),
+                    discord.SelectOption(label="📹 Vidéo Start", value="voice_video_start", description="Quand quelqu'un active sa caméra"),
+                    discord.SelectOption(label="📷 Vidéo Stop", value="voice_video_stop", description="Quand quelqu'un désactive sa caméra")
                 ]))
                 await interaction.response.edit_message(view=self) # Update to show select
                 return False

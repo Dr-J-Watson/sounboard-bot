@@ -65,7 +65,15 @@ class RoutineManager:
     EVENT_MAPPING = {
         "voice_join": "join",
         "voice_leave": "leave", 
-        "voice_move": "move"
+        "voice_move": "move",
+        "voice_mute": "mute",
+        "voice_unmute": "unmute",
+        "voice_deafen": "deafen",
+        "voice_undeafen": "undeafen",
+        "voice_stream_start": "stream_start",
+        "voice_stream_stop": "stream_stop",
+        "voice_video_start": "video_start",
+        "voice_video_stop": "video_stop"
     }
     
     def __init__(self, bot, db):
@@ -334,6 +342,10 @@ class RoutineManager:
         - voice_join : arrivée dans un salon (aussi sur move)
         - voice_leave : départ d'un salon (aussi sur move)
         - voice_move : changement de salon uniquement
+        - voice_mute/unmute : micro coupé/activé
+        - voice_deafen/undeafen : casque coupé/activé
+        - voice_stream_start/stop : partage d'écran
+        - voice_video_start/stop : caméra
         
         Args:
             before: État avant
@@ -343,7 +355,9 @@ class RoutineManager:
             Liste de tuples (event_type, channel)
         """
         events = []
+        current_channel = after.channel or before.channel
         
+        # Événements de changement de salon
         if before.channel is None and after.channel is not None:
             # Rejoint un salon depuis aucun salon
             events.append(("voice_join", after.channel))
@@ -356,6 +370,30 @@ class RoutineManager:
             events.append(("voice_leave", before.channel))  # Quitte l'ancien
             events.append(("voice_join", after.channel))     # Rejoint le nouveau
             events.append(("voice_move", after.channel))     # Move spécifique
+        
+        # Événements de mute (self_mute = micro coupé par l'utilisateur)
+        if not before.self_mute and after.self_mute:
+            events.append(("voice_mute", current_channel))
+        elif before.self_mute and not after.self_mute:
+            events.append(("voice_unmute", current_channel))
+        
+        # Événements de deafen (self_deaf = casque coupé par l'utilisateur)
+        if not before.self_deaf and after.self_deaf:
+            events.append(("voice_deafen", current_channel))
+        elif before.self_deaf and not after.self_deaf:
+            events.append(("voice_undeafen", current_channel))
+        
+        # Événements de stream (partage d'écran)
+        if not before.self_stream and after.self_stream:
+            events.append(("voice_stream_start", current_channel))
+        elif before.self_stream and not after.self_stream:
+            events.append(("voice_stream_stop", current_channel))
+        
+        # Événements de vidéo (caméra)
+        if not before.self_video and after.self_video:
+            events.append(("voice_video_start", current_channel))
+        elif before.self_video and not after.self_video:
+            events.append(("voice_video_stop", current_channel))
         
         return events
 

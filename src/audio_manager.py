@@ -11,6 +11,7 @@ Auteur: Soundboard Bot
 import os
 import logging
 import shutil
+import uuid
 from typing import Optional
 from mutagen import File as MutagenFile
 from mutagen.mp3 import MP3
@@ -186,12 +187,13 @@ class AudioManager:
         guild_sounds_dir = os.path.join(Config.SOUNDS_DIR, str(guild_id))
         os.makedirs(guild_sounds_dir, exist_ok=True)
 
-        # Nettoyer le nom de fichier pour éviter les problèmes
-        safe_filename = self.sanitize_filename(filename)
+        # Générer un UUID pour le nom de fichier (seul le nom d'affichage sera modifiable)
+        file_ext = os.path.splitext(filename)[1].lower()
+        uuid_filename = f"{uuid.uuid4().hex}{file_ext}"
         
         # Chemins temporaire et final
-        temp_path = os.path.join(guild_sounds_dir, f"temp_{safe_filename}")
-        final_path = os.path.join(guild_sounds_dir, safe_filename)
+        temp_path = os.path.join(guild_sounds_dir, f"temp_{uuid_filename}")
+        final_path = os.path.join(guild_sounds_dir, uuid_filename)
 
         try:
             # Télécharger le fichier temporairement

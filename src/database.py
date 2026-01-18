@@ -158,7 +158,76 @@ class DatabaseManager:
                 pass
             
             await db.commit()
-            logger.info("Base de données initialisée avec succès")
+            
+        # Migration des fichiers sons vers UUID (hors transaction pour accès fichiers)
+        await self._migrate_sound_files_to_uuid()
+        
+        logger.info("Base de données initialisée avec succès")
+
+    async def _migrate_sound_files_to_uuid(self) -> None:
+        """
+        Migre les fichiers sons existants vers des noms UUID.
+        
+        Cette migration renomme tous les fichiers qui n'ont pas encore
+        un nom UUID pour assurer la rétrocompatibilité.
+        """
+        import uuid as uuid_module
+        import re
+        
+        # Pattern pour détecter un UUID hex (32 caractères hex)
+        uuid_pattern = re.compile(r'^[a-f0-9]{32}\.[a-zA-Z0-9]+$')
+        
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            
+            # Récupérer tous les sons
+            cursor = await db.execute("SELECT id, guild_id, filename FROM sounds")
+            sounds = await cursor.fetchall()
+            await cursor.close()
+            
+            migrated_count = 0
+            
+            for sound in sounds:
+                old_filename = sound['filename']
+                guild_id = sound['guild_id']
+                sound_id = sound['id']
+                
+                # Vérifier si le fichier a déjà un nom UUID
+                if uuid_pattern.match(old_filename):
+                    continue
+                
+                # Construire les chemins
+                guild_sounds_dir = os.path.join(Config.SOUNDS_DIR, guild_id)
+                old_path = os.path.join(guild_sounds_dir, old_filename)
+                
+                if not os.path.exists(old_path):
+                    logger.warning(f"Fichier introuvable pour migration: {old_path}")
+                    continue
+                
+                # Générer un nouveau nom UUID
+                file_ext = os.path.splitext(old_filename)[1].lower()
+                new_filename = f"{uuid_module.uuid4().hex}{file_ext}"
+                new_path = os.path.join(guild_sounds_dir, new_filename)
+                
+                try:
+                    # Renommer le fichier
+                    os.rename(old_path, new_path)
+                    
+                    # Mettre à jour la base de données
+                    await db.execute(
+                        "UPDATE sounds SET filename = ? WHERE id = ?",
+                        (new_filename, sound_id)
+                    )
+                    
+                    migrated_count += 1
+                    logger.debug(f"Fichier migré: {old_filename} -> {new_filename}")
+                    
+                except OSError as e:
+                    logger.error(f"Erreur lors de la migration de {old_filename}: {e}")
+            
+            if migrated_count > 0:
+                await db.commit()
+                logger.info(f"Migration UUID: {migrated_count} fichier(s) renommé(s)")
 
     # ==================== Configuration ====================
 
@@ -399,6 +468,8 @@ class DatabaseManager:
         Synchronise la base de données avec les fichiers présents dans un dossier.
         
         Ajoute les fichiers audio présents sur le disque mais absents de la DB.
+        Note: Les fichiers sont maintenant stockés avec des noms UUID, donc on
+        vérifie par filename plutôt que par nom d'affichage.
         
         Args:
             guild_id: ID du serveur ou "global"
@@ -423,18 +494,43 @@ class DatabaseManager:
             if os.path.splitext(f)[1].lower() in Config.ALLOWED_EXTENSIONS
         ]
         
-        # Récupérer les sons existants
-        db_sounds = await self.list_sounds(guild_id)
+        # Récupérer les filenames existants dans la DB
+        existing_filenames = set()
+        async with self._get_connection() as db:
+            async with db.execute(
+                "SELECT filename FROM sounds WHERE guild_id = ?",
+                (str(guild_id),)
+            ) as cursor:
+                rows = await cursor.fetchall()
+                existing_filenames = {row[0] for row in rows}
         
         added_count = 0
         for filename in audio_files:
-            # Générer le nom à partir du fichier
-            name = os.path.splitext(filename)[0].lower().replace(" ", "_")
+            # Vérifier si le fichier est déjà dans la DB (par filename)
+            if filename in existing_filenames:
+                continue
             
-            # Ajouter si absent de la DB
-            if name not in db_sounds:
-                await self.add_sound(guild_id, name, filename, "System Sync")
-                added_count += 1
+            # Générer le nom d'affichage à partir du fichier
+            # Si c'est un UUID, utiliser un nom par défaut
+            import re
+            uuid_pattern = re.compile(r'^[a-f0-9]{32}\.[a-zA-Z0-9]+$')
+            
+            if uuid_pattern.match(filename):
+                # Fichier orphelin avec nom UUID - générer un nom
+                name = f"son_{filename[:8]}"
+            else:
+                name = os.path.splitext(filename)[0].lower().replace(" ", "_")
+            
+            # Vérifier que le nom n'existe pas déjà, sinon ajouter un suffixe
+            db_sounds = await self.list_sounds(guild_id)
+            original_name = name
+            counter = 1
+            while name in db_sounds:
+                name = f"{original_name}_{counter}"
+                counter += 1
+            
+            await self.add_sound(guild_id, name, filename, "System Sync")
+            added_count += 1
         
         if added_count > 0:
             logger.info(f"Sync: {added_count} fichier(s) ajouté(s) pour guild={guild_id}")
