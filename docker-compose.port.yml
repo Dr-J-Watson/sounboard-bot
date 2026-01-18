@@ -1,0 +1,15 @@
+version: "3.9"
+
+services:
+  bot:
+    build: .
+    container_name: soundboard_bot
+    network_mode: host
+    environment:
+      - TZ=Europe/Paris
+    env_file:
+      - stack.env
+    volumes:
+      - ./sounds:/app/sounds
+      - ./data:/app/data
+    restart: unless-stopped

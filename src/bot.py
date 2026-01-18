@@ -1,10 +1,23 @@
+"""
+Bot Discord Soundboard - Module Principal.
+
+Ce bot permet de gérer un soundboard sur Discord avec les fonctionnalités suivantes :
+- Lecture de sons dans les salons vocaux
+- Gestion des sons par serveur et sons globaux
+- Routines automatisées (timers, événements vocaux)
+- Configuration personnalisée par serveur
+- Interface d'administration
+
+Auteur: Soundboard Bot
+"""
+
 import discord
 from discord import app_commands
 from discord.ext import commands
 import logging
 import os
 import sys
-from typing import Optional
+from typing import Optional, List
 
 # Import des modules locaux
 from config import Config
@@ -13,76 +26,207 @@ from audio_manager import AudioManager
 from player import PlayerManager
 from routine_manager import RoutineManager
 
-# Configuration du logging simple
-logging.basicConfig(level=logging.INFO)
+# === Configuration du logging ===
+logging.basicConfig(
+    level=getattr(logging, Config.LOG_LEVEL, logging.INFO),
+    format='%(asctime)s | %(levelname)-8s | %(name)s | %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
 logger = logging.getLogger("SoundboardBot")
 
-# Validation de la configuration
+# Réduire le bruit des bibliothèques externes
+logging.getLogger("discord").setLevel(logging.WARNING)
+logging.getLogger("discord.http").setLevel(logging.WARNING)
+
+# === Validation de la configuration ===
 try:
     Config.validate()
+    logger.info("✅ Configuration validée")
 except ValueError as e:
-    logger.critical(f"Erreur de configuration: {e}")
+    logger.critical(f"❌ Erreur de configuration: {e}")
     sys.exit(1)
 
-# Initialisation des composants
+# === Initialisation des composants ===
 db = DatabaseManager(Config.DB_FILE)
 audio_manager = AudioManager(db)
 
-# Configuration des intents
+# === Configuration des intents Discord ===
 intents = discord.Intents.default()
-intents.voice_states = True # Required for voice routines
+intents.voice_states = True  # Requis pour les routines vocales
+intents.guilds = True        # Requis pour la gestion des serveurs
+
 
 class SoundboardBot(commands.Bot):
+    """
+    Bot principal du Soundboard.
+    
+    Hérite de commands.Bot et ajoute la gestion des composants
+    spécifiques au soundboard (player, routines).
+    
+    Attributes:
+        player_manager: Gestionnaire de lecture audio
+        routine_manager: Gestionnaire des routines automatisées
+    """
+    
     def __init__(self):
+        """Initialise le bot avec les intents et les gestionnaires."""
         super().__init__(command_prefix="!", intents=intents)
         self.player_manager = PlayerManager(self, Config.VOICE_TIMEOUT_SECONDS)
         self.routine_manager = RoutineManager(self, db)
 
-    async def setup_hook(self):
-        await db.init_db()
-        await self.routine_manager.load_routines()
+    async def setup_hook(self) -> None:
+        """
+        Hook de configuration appelé avant la connexion.
         
-        # Sync global sounds
+        Initialise la base de données et synchronise les sons avec le système de fichiers.
+        Note: Les routines sont chargées dans on_ready() car les guilds ne sont pas encore disponibles ici.
+        """
+        # Initialiser la base de données
+        await db.init_db()
+        logger.info("📦 Base de données initialisée")
+        
+        # Synchroniser les sons globaux
         global_path = os.path.join(Config.SOUNDS_DIR, "global")
         if os.path.exists(global_path):
-            await db.sync_with_folder("global", global_path)
+            count = await db.sync_with_folder("global", global_path)
+            if count > 0:
+                logger.info(f"🔄 {count} son(s) global(aux) synchronisé(s)")
         else:
             os.makedirs(global_path, exist_ok=True)
+            logger.info("📁 Dossier global créé")
 
-        # Sync all guilds found in sounds dir
+        # Synchroniser les sons de chaque serveur
         if os.path.exists(Config.SOUNDS_DIR):
             for guild_id in os.listdir(Config.SOUNDS_DIR):
-                if guild_id == "global": continue
+                if guild_id == "global":
+                    continue
                 guild_path = os.path.join(Config.SOUNDS_DIR, guild_id)
                 if os.path.isdir(guild_path):
-                    await db.sync_with_folder(guild_id, guild_path)
+                    count = await db.sync_with_folder(guild_id, guild_path)
+                    if count > 0:
+                        logger.info(f"🔄 {count} son(s) synchronisé(s) pour {guild_id}")
         
+        # Synchroniser les commandes slash
         await self.tree.sync()
-        logger.info("Commandes slash synchronisées.")
+        logger.info("⚡ Commandes slash synchronisées")
 
-    async def on_ready(self):
-        logger.info(f'Connecté en tant que {self.user} (ID: {self.user.id})')
+    async def on_ready(self) -> None:
+        """Appelé quand le bot est prêt et connecté."""
+        logger.info(f"🤖 Connecté en tant que {self.user} (ID: {self.user.id})")
+        logger.info(f"📊 {len(self.guilds)} serveur(s) | {len(self.users)} utilisateur(s)")
+        
+        # Charger les routines maintenant que les guilds sont disponibles
+        await self.routine_manager.load_routines()
+        
+        # Charger Opus pour l'audio
         if not discord.opus.is_loaded():
-            discord.opus.load_opus('libopus.so.0')
-        logger.info(f'Opus loaded: {discord.opus.is_loaded()}')
+            try:
+                discord.opus.load_opus('libopus.so.0')
+                logger.info("🔊 Opus chargé avec succès")
+            except Exception as e:
+                logger.warning(f"⚠️ Impossible de charger Opus: {e}")
+        
+        # Définir le statut
+        activity = discord.Activity(
+            type=discord.ActivityType.listening,
+            name="/play | /help"
+        )
+        await self.change_presence(activity=activity)
 
-    async def on_voice_state_update(self, member, before, after):
+    async def on_voice_state_update(
+        self,
+        member: discord.Member,
+        before: discord.VoiceState,
+        after: discord.VoiceState
+    ) -> None:
+        """
+        Gère les changements d'état vocal.
+        
+        Transmet les événements au gestionnaire de routines.
+        Détecte aussi quand le bot se retrouve seul dans un salon.
+        """
+        # Vérifier si le bot se retrouve seul dans un salon
+        await self._check_bot_alone(member, before)
+        
+        # Transmettre aux routines
         await self.routine_manager.on_voice_state_update(member, before, after)
 
+    async def _check_bot_alone(
+        self,
+        member: discord.Member,
+        before: discord.VoiceState
+    ) -> None:
+        """
+        Vérifie si le bot se retrouve seul dans un salon après un départ.
+        Si oui, arrête la lecture et quitte le salon.
+        """
+        # On ne s'intéresse qu'aux départs de salon
+        if before.channel is None:
+            return
+        
+        # Ne pas réagir si c'est le bot qui part
+        if member.id == self.user.id:
+            return
+        
+        # Vérifier si le bot est dans ce salon
+        voice_client = member.guild.voice_client
+        if not voice_client or voice_client.channel != before.channel:
+            return
+        
+        # Compter les membres humains restants (excluant les bots)
+        human_members = [m for m in before.channel.members if not m.bot]
+        
+        if len(human_members) == 0:
+            logger.info(f"🚶 Bot seul dans {before.channel.name}, arrêt et déconnexion")
+            
+            # Arrêter le player de ce serveur
+            guild_id = str(member.guild.id)
+            if guild_id in self.player_manager.players:
+                player = self.player_manager.players[guild_id]
+                player.stop()  # Arrête la lecture et vide la queue
+            
+            # Déconnecter immédiatement
+            await voice_client.disconnect(force=True)
+
+    async def close(self) -> None:
+        """Nettoyage lors de l'arrêt du bot."""
+        logger.info("🛑 Arrêt du bot...")
+        
+        # Arrêter les routines
+        await self.routine_manager.stop()
+        
+        # Déconnecter tous les players
+        await self.player_manager.disconnect_all()
+        
+        await super().close()
+
+
+# === Instance du bot ===
 bot = SoundboardBot()
 
+
+# =============================================================================
+# COMMANDES GÉNÉRALES
+# =============================================================================
+
 @bot.tree.command(name="help", description="Affiche la liste des commandes et l'aide pour les routines.")
-async def help_command(interaction: discord.Interaction):
-    embed = discord.Embed(title="📖 Aide du Soundboard", color=discord.Color.gold())
+async def help_command(interaction: discord.Interaction) -> None:
+    """Affiche l'aide complète du bot."""
+    embed = discord.Embed(
+        title="📖 Aide du Soundboard",
+        color=discord.Color.gold(),
+        description="Bienvenue ! Voici toutes les commandes disponibles."
+    )
     
-    # Commandes Générales
+    # Commandes Sons
     embed.add_field(
         name="🎵 Sons",
         value=(
             "`/play <nom>` : Joue un son\n"
             "`/stop` : Arrête la lecture\n"
+            "`/skip` : Passe au son suivant\n"
             "`/list_sounds` : Liste les sons disponibles\n"
-            "`/add_sound <fichier> [nom]` : Ajoute un son au serveur"
+            "`/add_sound <fichier> [nom]` : Ajoute un son"
         ),
         inline=False
     )
@@ -103,9 +247,10 @@ async def help_command(interaction: discord.Interaction):
         name="🤖 Routines (Automatisations)",
         value=(
             "`/routine_list` : Voir les routines actives\n"
+            "`/routine_create` : Créer avec l'assistant\n"
             "`/routine_toggle <id>` : Activer/Désactiver\n"
             "`/routine_delete <id>` : Supprimer\n"
-            "`/routine_cmd <nom> <commande>` : Créer une routine via commande"
+            "`/routine_cmd <nom> <commande>` : Créer via commande"
         ),
         inline=False
     )
@@ -117,10 +262,8 @@ async def help_command(interaction: discord.Interaction):
         "• `timer 30s` / `5m` / `1h`\n"
         "• `on join` / `leave` / `move`\n\n"
         "**Conditions (Optionnel) :**\n"
-        "• `user=ID`\n"
-        "• `channel=ID`\n"
-        "• `role=ID`\n"
-        "• `time=18:00-23:00`\n"
+        "• `user=ID` • `channel=ID`\n"
+        "• `role=ID` • `time=18:00-23:00`\n"
         "*(Séparer par `and`)*\n\n"
         "**Actions :**\n"
         "• `play <nom_son>`\n"
@@ -128,185 +271,473 @@ async def help_command(interaction: discord.Interaction):
         "*(Séparer par `then`)*\n\n"
         "**Exemple :**\n"
         "`timer 10m do play alerte`\n"
-        "`on join if user=12345 do wait 2s then play bienvenue`"
+        "`on join if user=123 do wait 2s then play bienvenue`"
     )
     embed.add_field(name="📝 Syntaxe des Routines", value=routine_help, inline=False)
     
+    embed.set_footer(text="💡 Utilisez /routine_create pour un assistant interactif !")
+    
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
+
 @bot.tree.command(name="list_sounds", description="Liste tous les sons disponibles.")
-async def list_sounds(interaction: discord.Interaction):
+async def list_sounds(interaction: discord.Interaction) -> None:
+    """Liste tous les sons disponibles pour le serveur."""
     if not interaction.guild_id:
-        await interaction.response.send_message("Cette commande ne peut être utilisée que sur un serveur.", ephemeral=True)
+        await interaction.response.send_message(
+            "❌ Cette commande ne peut être utilisée que sur un serveur.",
+            ephemeral=True
+        )
         return
 
     sounds = await db.get_available_sounds(str(interaction.guild_id))
+    
     if not sounds:
-        await interaction.response.send_message("Aucun son disponible.", ephemeral=True)
+        await interaction.response.send_message(
+            "📭 Aucun son disponible.\nUtilisez `/add_sound` pour en ajouter !",
+            ephemeral=True
+        )
         return
     
+    # Trier et formater la liste
     sound_list = sorted(sounds.keys())
-    message = "**Sons disponibles :**\n" + ", ".join([f"`{s}`" for s in sound_list])
-    if len(message) > 2000:
-        message = message[:1997] + "..."
-    await interaction.response.send_message(message, ephemeral=True)
+    
+    # Créer un embed avec pagination si nécessaire
+    embed = discord.Embed(
+        title="🎵 Sons disponibles",
+        color=discord.Color.blue(),
+        description=f"**{len(sound_list)}** son(s) disponible(s)"
+    )
+    
+    # Grouper les sons par chunks pour l'affichage
+    chunk_size = 20
+    for i in range(0, len(sound_list), chunk_size):
+        chunk = sound_list[i:i + chunk_size]
+        chunk_text = ", ".join([f"`{s}`" for s in chunk])
+        field_name = f"Sons {i+1}-{min(i+chunk_size, len(sound_list))}"
+        embed.add_field(name=field_name, value=chunk_text, inline=False)
+    
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
-async def sound_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+
+async def sound_autocomplete(
+    interaction: discord.Interaction,
+    current: str
+) -> List[app_commands.Choice[str]]:
+    """Autocomplétion pour les noms de sons."""
     if not interaction.guild_id:
         return []
+    
     sounds = await db.get_available_sounds(str(interaction.guild_id))
-    return [
+    
+    # Filtrer et limiter les résultats
+    filtered = [
         app_commands.Choice(name=sound, value=sound)
-        for sound in sounds.keys()
+        for sound in sorted(sounds.keys())
         if current.lower() in sound.lower()
-    ][:25]
+    ]
+    
+    return filtered[:25]
 
-@bot.tree.command(name="play", description="Joue un son.")
+
+@bot.tree.command(name="play", description="Joue un son dans un salon vocal.")
 @app_commands.describe(
-    sound_name="Le nom du son à jouer",
+    sound_name="Le nom du son à jouer (optionnel - affiche une liste si non spécifié)",
     channel="Le salon vocal où jouer le son (optionnel)"
 )
 @app_commands.autocomplete(sound_name=sound_autocomplete)
-async def play(interaction: discord.Interaction, sound_name: str, channel: Optional[discord.VoiceChannel] = None):
+async def play(
+    interaction: discord.Interaction,
+    sound_name: Optional[str] = None,
+    channel: Optional[discord.VoiceChannel] = None
+) -> None:
+    """Joue un son dans le salon vocal."""
     if not interaction.guild_id:
-        await interaction.response.send_message("Cette commande ne peut être utilisée que sur un serveur.", ephemeral=True)
+        await interaction.response.send_message(
+            "❌ Cette commande ne peut être utilisée que sur un serveur.",
+            ephemeral=True
+        )
         return
 
+    # Déterminer le salon cible
     target_channel = channel
     if not target_channel:
         if interaction.user.voice:
             target_channel = interaction.user.voice.channel
+        else:
+            await interaction.response.send_message(
+                "❌ Vous devez être dans un salon vocal ou spécifier un salon.",
+                ephemeral=True
+            )
+            return
 
-    if not target_channel:
-        await interaction.response.send_message("Vous devez être dans un salon vocal ou spécifier un salon.", ephemeral=True)
+    # Vérifier si le salon est ignoré
+    if await db.is_channel_ignored(str(interaction.guild_id), str(target_channel.id)):
+        await interaction.response.send_message(
+            f"🔇 Le salon **{target_channel.name}** est ignoré.\n"
+            "Utilisez `/ignored` pour voir la liste des salons ignorés.",
+            ephemeral=True
+        )
         return
 
-    # Check local first, then global
+    # Si aucun son spécifié, afficher le sélecteur
+    if not sound_name:
+        view = SoundSelectorView(bot, db, interaction.guild_id, target_channel, interaction.user)
+        await view.initialize()
+        
+        if not view.all_sounds:
+            await interaction.response.send_message(
+                "❌ Aucun son disponible sur ce serveur.",
+                ephemeral=True
+            )
+            return
+        
+        embed = view.build_embed()
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+        return
+
+    # Rechercher le son (local d'abord, puis global)
     sound_data = await db.get_sound(str(interaction.guild_id), sound_name)
     if not sound_data:
         sound_data = await db.get_sound("global", sound_name)
 
     if not sound_data:
-        await interaction.response.send_message(f"Le son `{sound_name}` n'existe pas.", ephemeral=True)
+        await interaction.response.send_message(
+            f"❌ Le son `{sound_name}` n'existe pas.",
+            ephemeral=True
+        )
         return
 
-    # Determine correct path based on where the sound was found
-    sound_guild_id = sound_data['guild_id']
-    file_path = os.path.join(Config.SOUNDS_DIR, sound_guild_id, sound_data['filename'])
+    # Vérifier le fichier
+    file_path = Config.get_sound_path(sound_data['guild_id'], sound_data['filename'])
     
     if not os.path.exists(file_path):
-        await interaction.response.send_message(f"Fichier introuvable pour `{sound_name}`.", ephemeral=True)
+        await interaction.response.send_message(
+            f"❌ Fichier introuvable pour `{sound_name}`.",
+            ephemeral=True
+        )
         return
 
     await interaction.response.defer(ephemeral=True)
     
+    # Ajouter à la queue
     player = bot.player_manager.get_player(interaction.guild_id)
-    player.add_to_queue(file_path, interaction.user.display_name, sound_name, target_channel)
+    position = player.add_to_queue(
+        file_path,
+        interaction.user.display_name,
+        sound_name,
+        target_channel
+    )
     
-    await interaction.followup.send(f"🎵 **{sound_name}** ajouté à la file dans {target_channel.mention}.", ephemeral=True)
+    # Incrémenter le compteur de lecture
+    await db.increment_play_count(sound_data['guild_id'], sound_name)
+    
+    # Message de confirmation
+    if position == 1:
+        msg = f"🎵 **{sound_name}** en lecture dans {target_channel.mention}"
+    else:
+        msg = f"🎵 **{sound_name}** ajouté à la file (position {position}) dans {target_channel.mention}"
+    
+    await interaction.followup.send(msg, ephemeral=True)
 
-@bot.tree.command(name="stop", description="Arrête la lecture.")
-async def stop(interaction: discord.Interaction):
+
+@bot.tree.command(name="stop", description="Arrête la lecture et vide la file d'attente.")
+async def stop(interaction: discord.Interaction) -> None:
+    """Arrête la lecture en cours."""
+    if not interaction.guild_id:
+        return
+    
     player = bot.player_manager.get_player(interaction.guild_id)
     player.stop()
+    
     await interaction.response.send_message("⏹️ Lecture arrêtée.", ephemeral=True)
 
-@bot.tree.command(name="add_sound", description="Ajoute un son.")
-async def add_sound(interaction: discord.Interaction, attachment: discord.Attachment, name: Optional[str] = None):
+
+@bot.tree.command(name="skip", description="Passe au son suivant dans la file d'attente.")
+async def skip(interaction: discord.Interaction) -> None:
+    """Passe au son suivant."""
     if not interaction.guild_id:
-        await interaction.response.send_message("Cette commande ne peut être utilisée que sur un serveur.", ephemeral=True)
+        return
+    
+    player = bot.player_manager.get_player(interaction.guild_id)
+    
+    if player.skip():
+        await interaction.response.send_message("⏭️ Son suivant.", ephemeral=True)
+    else:
+        await interaction.response.send_message(
+            "❌ Aucun son en cours de lecture.",
+            ephemeral=True
+        )
+
+
+@bot.tree.command(name="queue", description="Affiche la file d'attente actuelle.")
+async def queue(interaction: discord.Interaction) -> None:
+    """Affiche la file d'attente."""
+    if not interaction.guild_id:
+        return
+    
+    player = bot.player_manager.get_player(interaction.guild_id)
+    info = player.get_queue_info()
+    
+    embed = discord.Embed(title="📋 File d'attente", color=discord.Color.blue())
+    
+    if info['current_sound']:
+        embed.add_field(
+            name="▶️ En cours",
+            value=f"`{info['current_sound'][0]}` (par {info['current_sound'][1]})",
+            inline=False
+        )
+    else:
+        embed.add_field(name="▶️ En cours", value="*Rien*", inline=False)
+    
+    if info['queue']:
+        queue_text = "\n".join([
+            f"{i+1}. `{item['name']}` (par {item['requester']})"
+            for i, item in enumerate(info['queue'][:10])
+        ])
+        if len(info['queue']) > 10:
+            queue_text += f"\n... et {len(info['queue']) - 10} autre(s)"
+        embed.add_field(name="📝 En attente", value=queue_text, inline=False)
+    else:
+        embed.add_field(name="📝 En attente", value="*File vide*", inline=False)
+    
+    embed.set_footer(text=f"Connecté: {'Oui' if info['is_connected'] else 'Non'}")
+    
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="add_sound", description="Ajoute un nouveau son au serveur.")
+@app_commands.describe(
+    attachment="Le fichier audio à ajouter",
+    name="Nom personnalisé pour le son (optionnel)"
+)
+async def add_sound(
+    interaction: discord.Interaction,
+    attachment: discord.Attachment,
+    name: Optional[str] = None
+) -> None:
+    """Ajoute un son au soundboard du serveur."""
+    if not interaction.guild_id:
+        await interaction.response.send_message(
+            "❌ Cette commande ne peut être utilisée que sur un serveur.",
+            ephemeral=True
+        )
         return
 
     await interaction.response.defer(ephemeral=True)
+    
+    # Générer le nom si non fourni
     if not name:
         name = os.path.splitext(attachment.filename)[0]
-    name = name.lower().replace(" ", "_")
-
-    max_name_length = await db.get_config(str(interaction.guild_id), "max_name_length", Config.MAX_NAME_LENGTH)
+    
+    # Normaliser le nom
+    name = name.lower().replace(" ", "_").strip()
+    
+    # Vérifier la longueur du nom
+    max_name_length = await db.get_config(
+        str(interaction.guild_id),
+        "max_name_length",
+        Config.MAX_NAME_LENGTH
+    )
+    
     if max_name_length > 0 and len(name) > max_name_length:
-        await interaction.followup.send(f"Le nom est trop long (max {max_name_length} caractères).", ephemeral=True)
+        await interaction.followup.send(
+            f"❌ Le nom est trop long ({len(name)} caractères). "
+            f"Maximum: {max_name_length} caractères.",
+            ephemeral=True
+        )
         return
 
+    # Vérifier si le son existe déjà
     if await db.get_sound(str(interaction.guild_id), name):
-        await interaction.followup.send(f"Le son `{name}` existe déjà.", ephemeral=True)
+        await interaction.followup.send(
+            f"❌ Le son `{name}` existe déjà sur ce serveur.",
+            ephemeral=True
+        )
         return
 
     try:
-        saved_path = await audio_manager.save_upload(attachment, attachment.filename, str(interaction.guild_id))
+        # Sauvegarder et valider le fichier
+        saved_path = await audio_manager.save_upload(
+            attachment,
+            attachment.filename,
+            str(interaction.guild_id)
+        )
         filename = os.path.basename(saved_path)
-        await db.add_sound(str(interaction.guild_id), name, filename, str(interaction.user))
-        await interaction.followup.send(f"✅ Son `{name}` ajouté !", ephemeral=True)
+        
+        # Ajouter à la base de données
+        await db.add_sound(
+            str(interaction.guild_id),
+            name,
+            filename,
+            str(interaction.user)
+        )
+        
+        await interaction.followup.send(
+            f"✅ Son `{name}` ajouté avec succès !",
+            ephemeral=True
+        )
+        
+    except ValueError as e:
+        await interaction.followup.send(f"❌ {e}", ephemeral=True)
     except Exception as e:
-        await interaction.followup.send(f"Erreur: {e}", ephemeral=True)
+        logger.error(f"Erreur lors de l'ajout du son: {e}", exc_info=True)
+        await interaction.followup.send(
+            f"❌ Erreur inattendue: {e}",
+            ephemeral=True
+        )
+
 
 @bot.tree.command(name="delete_sound", description="Supprime un son (Admin uniquement).")
 @app_commands.describe(sound_name="Le nom du son à supprimer")
 @app_commands.autocomplete(sound_name=sound_autocomplete)
-async def delete_sound(interaction: discord.Interaction, sound_name: str):
+async def delete_sound(interaction: discord.Interaction, sound_name: str) -> None:
+    """Supprime un son du soundboard."""
     if not interaction.guild_id:
-        await interaction.response.send_message("Cette commande ne peut être utilisée que sur un serveur.", ephemeral=True)
+        await interaction.response.send_message(
+            "❌ Cette commande ne peut être utilisée que sur un serveur.",
+            ephemeral=True
+        )
         return
 
+    # Vérifier les permissions
     if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("🚫 Vous devez être administrateur pour supprimer un son.", ephemeral=True)
+        await interaction.response.send_message(
+            "🚫 Vous devez être administrateur pour supprimer un son.",
+            ephemeral=True
+        )
         return
 
+    # Vérifier que le son existe
     sound_data = await db.get_sound(str(interaction.guild_id), sound_name)
     if not sound_data:
-        await interaction.response.send_message(f"Le son `{sound_name}` n'existe pas.", ephemeral=True)
+        await interaction.response.send_message(
+            f"❌ Le son `{sound_name}` n'existe pas.",
+            ephemeral=True
+        )
         return
 
-    # Delete file
-    file_path = os.path.join(Config.SOUNDS_DIR, str(interaction.guild_id), sound_data['filename'])
-    if os.path.exists(file_path):
-        try:
-            os.remove(file_path)
-        except Exception as e:
-            await interaction.response.send_message(f"Erreur lors de la suppression du fichier : {e}", ephemeral=True)
-            return
-
-    # Delete from DB
+    # Supprimer le fichier
+    await audio_manager.delete_sound_file(
+        str(interaction.guild_id),
+        sound_data['filename']
+    )
+    
+    # Supprimer de la base de données
     await db.remove_sound(str(interaction.guild_id), sound_name)
     
-    await interaction.response.send_message(f"✅ Le son `{sound_name}` a été supprimé.", ephemeral=True)
+    await interaction.response.send_message(
+        f"✅ Le son `{sound_name}` a été supprimé.",
+        ephemeral=True
+    )
+
+
+@bot.tree.command(name="rename_sound", description="Renomme un son (Admin uniquement).")
+async def rename_sound(interaction: discord.Interaction) -> None:
+    """Renomme un son du soundboard via un sélecteur interactif."""
+    if not interaction.guild_id:
+        await interaction.response.send_message(
+            "❌ Cette commande ne peut être utilisée que sur un serveur.",
+            ephemeral=True
+        )
+        return
+
+    # Vérifier les permissions
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message(
+            "🚫 Vous devez être administrateur pour renommer un son.",
+            ephemeral=True
+        )
+        return
+
+    # Créer et initialiser la vue
+    view = RenameSoundView(bot, db, interaction.guild_id, interaction.user)
+    await view.initialize()
+    
+    if not view.all_sounds:
+        await interaction.response.send_message(
+            "❌ Aucun son disponible sur ce serveur.",
+            ephemeral=True
+        )
+        return
+    
+    embed = view.build_embed()
+    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
 
 @bot.tree.command(name="config", description="Configure les paramètres du bot (Admin uniquement).")
 @app_commands.describe(
     setting="Le paramètre à modifier",
-    value="La nouvelle valeur"
+    value="La nouvelle valeur (0 = illimité)"
 )
 @app_commands.choices(setting=[
     app_commands.Choice(name="Durée max (secondes)", value="max_duration"),
     app_commands.Choice(name="Taille max (Mo)", value="max_file_size_mb"),
     app_commands.Choice(name="Longueur nom max", value="max_name_length")
 ])
-async def config(interaction: discord.Interaction, setting: str, value: int):
+async def config(
+    interaction: discord.Interaction,
+    setting: str,
+    value: int
+) -> None:
+    """Configure les paramètres du bot pour le serveur."""
     if not interaction.guild_id:
-        await interaction.response.send_message("Cette commande ne peut être utilisée que sur un serveur.", ephemeral=True)
+        await interaction.response.send_message(
+            "❌ Commande serveur uniquement.",
+            ephemeral=True
+        )
         return
 
     if not interaction.user.guild_permissions.administrator:
-         await interaction.response.send_message("🚫 Vous devez être administrateur pour modifier la configuration.", ephemeral=True)
-         return
+        await interaction.response.send_message(
+            "🚫 Vous devez être administrateur pour modifier la configuration.",
+            ephemeral=True
+        )
+        return
 
     if value < 0:
-        await interaction.response.send_message("🚫 La valeur doit être positive ou nulle (0 pour désactiver).", ephemeral=True)
+        await interaction.response.send_message(
+            "🚫 La valeur doit être positive ou nulle (0 = illimité).",
+            ephemeral=True
+        )
         return
 
     await db.set_config(str(interaction.guild_id), setting, value)
+    
+    # Message de confirmation
+    setting_names = {
+        "max_duration": "Durée maximale",
+        "max_file_size_mb": "Taille maximale",
+        "max_name_length": "Longueur max du nom"
+    }
+    setting_display = setting_names.get(setting, setting)
+    
     if value == 0:
-        await interaction.response.send_message(f"✅ Configuration mise à jour : `{setting}` = `Désactivé (Illimité)`", ephemeral=True)
+        await interaction.response.send_message(
+            f"✅ Configuration mise à jour : `{setting_display}` = `Illimité`",
+            ephemeral=True
+        )
     else:
-        await interaction.response.send_message(f"✅ Configuration mise à jour : `{setting}` = `{value}`", ephemeral=True)
+        unit = "s" if setting == "max_duration" else ("Mo" if setting == "max_file_size_mb" else "")
+        await interaction.response.send_message(
+            f"✅ Configuration mise à jour : `{setting_display}` = `{value}{unit}`",
+            ephemeral=True
+        )
 
-@bot.tree.command(name="sync", description="Synchronise la base de données avec les fichiers du dossier (Admin).")
-async def sync(interaction: discord.Interaction):
+@bot.tree.command(name="sync", description="Synchronise la base de données avec les fichiers (Admin).")
+async def sync(interaction: discord.Interaction) -> None:
+    """Synchronise la DB avec les fichiers présents sur le disque."""
     if not interaction.guild_id:
-        await interaction.response.send_message("Commande serveur uniquement.", ephemeral=True)
+        await interaction.response.send_message(
+            "❌ Commande serveur uniquement.",
+            ephemeral=True
+        )
         return
     
     if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("Réservé aux administrateurs.", ephemeral=True)
+        await interaction.response.send_message(
+            "🚫 Réservé aux administrateurs.",
+            ephemeral=True
+        )
         return
 
     await interaction.response.defer(ephemeral=True)
@@ -314,77 +745,693 @@ async def sync(interaction: discord.Interaction):
     guild_id = str(interaction.guild_id)
     guild_dir = os.path.join(Config.SOUNDS_DIR, guild_id)
     
-    await db.sync_with_folder(guild_id, guild_dir)
-    await interaction.followup.send("✅ Synchronisation terminée. Les fichiers présents sur le disque ont été ajoutés.", ephemeral=True)
+    count = await db.sync_with_folder(guild_id, guild_dir)
+    
+    if count > 0:
+        await interaction.followup.send(
+            f"✅ Synchronisation terminée : {count} nouveau(x) fichier(s) ajouté(s).",
+            ephemeral=True
+        )
+    else:
+        await interaction.followup.send(
+            "✅ Synchronisation terminée. Aucun nouveau fichier trouvé.",
+            ephemeral=True
+        )
 
-# --- Routines Commands ---
 
-@bot.tree.command(name="routine_list", description="Liste les routines configurées.")
-async def routine_list(interaction: discord.Interaction):
+# =============================================================================
+# COMMANDES SALONS IGNORÉS
+# =============================================================================
+
+@bot.tree.command(name="ignore", description="Ajoute ou retire un salon de la liste des salons ignorés (Admin).")
+@app_commands.describe(
+    channel="Le salon vocal à ignorer/réactiver",
+    action="Ajouter ou retirer le salon de la liste"
+)
+@app_commands.choices(action=[
+    app_commands.Choice(name="Ignorer ce salon", value="add"),
+    app_commands.Choice(name="Ne plus ignorer ce salon", value="remove")
+])
+async def ignore_channel(
+    interaction: discord.Interaction,
+    channel: discord.VoiceChannel,
+    action: str = "add"
+) -> None:
+    """Gère les salons ignorés par le bot."""
     if not interaction.guild_id:
-        await interaction.response.send_message("Commande serveur uniquement.", ephemeral=True)
+        await interaction.response.send_message(
+            "❌ Commande serveur uniquement.",
+            ephemeral=True
+        )
         return
     
-    routines = await db.get_routines(str(interaction.guild_id))
-    if not routines:
-        await interaction.response.send_message("Aucune routine configurée.", ephemeral=True)
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message(
+            "🚫 Réservé aux administrateurs.",
+            ephemeral=True
+        )
         return
     
-    embed = discord.Embed(title="Routines", color=discord.Color.purple())
-    for r in routines:
-        status = "✅" if r['active'] else "❌"
-        desc = f"Type: {r['trigger_type']}\n"
-        if r['trigger_type'] == 'event':
-            desc += f"Event: {r['trigger_data'].get('event')}\n"
+    guild_id = str(interaction.guild_id)
+    channel_id = str(channel.id)
+    
+    if action == "add":
+        success = await db.add_ignored_channel(
+            guild_id, 
+            channel_id, 
+            str(interaction.user.id)
+        )
+        if success:
+            await interaction.response.send_message(
+                f"🔇 Le salon **{channel.name}** est maintenant ignoré.\n"
+                "Le bot n'y déclenchera plus de routines et n'y jouera plus de sons automatiques.",
+                ephemeral=True
+            )
         else:
-            desc += f"Interval: {r['trigger_data'].get('interval_minutes')} min\n"
-        
-        actions = r['actions']
-        desc += f"Actions: {len(actions)}"
-        
-        embed.add_field(name=f"{status} {r['name']} (ID: {r['id']})", value=desc, inline=False)
+            await interaction.response.send_message(
+                f"ℹ️ Le salon **{channel.name}** est déjà ignoré.",
+                ephemeral=True
+            )
+    else:
+        success = await db.remove_ignored_channel(guild_id, channel_id)
+        if success:
+            await interaction.response.send_message(
+                f"🔊 Le salon **{channel.name}** n'est plus ignoré.\n"
+                "Les routines pourront à nouveau s'y déclencher.",
+                ephemeral=True
+            )
+        else:
+            await interaction.response.send_message(
+                f"ℹ️ Le salon **{channel.name}** n'était pas dans la liste des salons ignorés.",
+                ephemeral=True
+            )
+
+
+@bot.tree.command(name="ignored", description="Affiche la liste des salons ignorés.")
+async def ignored_channels(interaction: discord.Interaction) -> None:
+    """Affiche les salons ignorés du serveur."""
+    if not interaction.guild_id:
+        await interaction.response.send_message(
+            "❌ Commande serveur uniquement.",
+            ephemeral=True
+        )
+        return
+    
+    ignored = await db.get_ignored_channels(str(interaction.guild_id))
+    
+    if not ignored:
+        await interaction.response.send_message(
+            "📭 Aucun salon n'est ignoré.\n"
+            "Utilisez `/ignore` pour ajouter un salon à la liste.",
+            ephemeral=True
+        )
+        return
+    
+    # Résoudre les noms des salons
+    channel_list = []
+    for channel_id in ignored:
+        channel = interaction.guild.get_channel(int(channel_id))
+        if channel:
+            channel_list.append(f"🔇 {channel.mention}")
+        else:
+            channel_list.append(f"🔇 *(Salon supprimé: {channel_id})*")
+    
+    embed = discord.Embed(
+        title="🔇 Salons Ignorés",
+        description="\n".join(channel_list),
+        color=discord.Color.orange()
+    )
+    embed.set_footer(text="Utilisez /ignore pour modifier cette liste")
     
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-async def routine_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[int]]:
+
+# =============================================================================
+# COMMANDES ROUTINES
+# =============================================================================
+
+@bot.tree.command(name="routine_list", description="Liste les routines configurées.")
+async def routine_list(interaction: discord.Interaction) -> None:
+    """Affiche la liste des routines du serveur."""
+    if not interaction.guild_id:
+        await interaction.response.send_message(
+            "❌ Commande serveur uniquement.",
+            ephemeral=True
+        )
+        return
+    
+    routines = await db.get_routines(str(interaction.guild_id))
+    
+    if not routines:
+        await interaction.response.send_message(
+            "📭 Aucune routine configurée.\n"
+            "Utilisez `/routine_create` ou `/routine_cmd` pour en créer une !",
+            ephemeral=True
+        )
+        return
+    
+    embed = discord.Embed(
+        title="🤖 Routines",
+        color=discord.Color.purple(),
+        description=f"**{len(routines)}** routine(s) configurée(s)"
+    )
+    
+    for r in routines:
+        status = "✅" if r['active'] else "❌"
+        
+        # Description du trigger
+        if r['trigger_type'] == 'timer':
+            interval = r['trigger_data'].get('interval_minutes', 0)
+            if interval == 0:
+                interval = f"{r['trigger_data'].get('interval_seconds', 0)}s"
+            else:
+                interval = f"{interval}m"
+            trigger_desc = f"⏰ Timer ({interval})"
+        else:
+            event_name = r['trigger_data'].get('event', '?')
+            trigger_desc = f"⚡ {event_name.replace('voice_', '')}"
+        
+        # Nombre d'actions
+        actions_count = len(r['actions'])
+        
+        desc = f"{trigger_desc}\n📋 {actions_count} action(s)"
+        
+        embed.add_field(
+            name=f"{status} {r['name']} (ID: {r['id']})",
+            value=desc,
+            inline=True
+        )
+    
+    embed.set_footer(text="💡 Utilisez /routine_toggle pour activer/désactiver")
+    
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+async def routine_autocomplete(
+    interaction: discord.Interaction,
+    current: str
+) -> List[app_commands.Choice[int]]:
+    """Autocomplétion pour les routines."""
     if not interaction.guild_id:
         return []
     
     routines = await db.get_routines(str(interaction.guild_id))
     choices = []
+    
     for r in routines:
         display = f"{r['name']} ({'ON' if r['active'] else 'OFF'})"
-        if current.lower() in display.lower():
+        if current.lower() in display.lower() or current in str(r['id']):
             choices.append(app_commands.Choice(name=display, value=r['id']))
     
     return choices[:25]
 
+
 @bot.tree.command(name="routine_delete", description="Supprime une routine.")
 @app_commands.describe(routine_id="La routine à supprimer")
 @app_commands.autocomplete(routine_id=routine_autocomplete)
-async def routine_delete(interaction: discord.Interaction, routine_id: int):
-    if not interaction.guild_id: return
+async def routine_delete(interaction: discord.Interaction, routine_id: int) -> None:
+    """Supprime une routine."""
+    if not interaction.guild_id:
+        return
+        
     if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("Réservé aux administrateurs.", ephemeral=True)
+        await interaction.response.send_message(
+            "🚫 Réservé aux administrateurs.",
+            ephemeral=True
+        )
         return
 
-    await db.delete_routine(routine_id)
-    await bot.routine_manager.load_routines() # Reload
-    await interaction.response.send_message(f"✅ Routine supprimée.", ephemeral=True)
+    deleted = await db.delete_routine(routine_id)
+    
+    if deleted:
+        await bot.routine_manager.load_routines()
+        await interaction.response.send_message(
+            "✅ Routine supprimée.",
+            ephemeral=True
+        )
+    else:
+        await interaction.response.send_message(
+            "❌ Routine introuvable.",
+            ephemeral=True
+        )
+
 
 @bot.tree.command(name="routine_toggle", description="Active/Désactive une routine.")
 @app_commands.describe(routine_id="La routine à basculer")
 @app_commands.autocomplete(routine_id=routine_autocomplete)
-async def routine_toggle(interaction: discord.Interaction, routine_id: int):
-    if not interaction.guild_id: return
+async def routine_toggle(interaction: discord.Interaction, routine_id: int) -> None:
+    """Active ou désactive une routine."""
+    if not interaction.guild_id:
+        return
+        
     if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("Réservé aux administrateurs.", ephemeral=True)
+        await interaction.response.send_message(
+            "🚫 Réservé aux administrateurs.",
+            ephemeral=True
+        )
         return
 
     new_state = await db.toggle_routine(routine_id)
-    await bot.routine_manager.load_routines() # Reload
-    status = "activée" if new_state else "désactivée"
-    await interaction.response.send_message(f"✅ Routine {status}.", ephemeral=True)
+    
+    if new_state is not None:
+        await bot.routine_manager.load_routines()
+        status = "activée ✅" if new_state else "désactivée ❌"
+        await interaction.response.send_message(
+            f"✅ Routine {status}.",
+            ephemeral=True
+        )
+    else:
+        await interaction.response.send_message(
+            "❌ Routine introuvable.",
+            ephemeral=True
+        )
+
+
+class SoundSelectorView(discord.ui.View):
+    """Vue de sélection de son avec pagination pour /play."""
+    
+    def __init__(self, bot, db, guild_id: int, target_channel: discord.VoiceChannel, user: discord.Member):
+        super().__init__(timeout=120)
+        self.bot = bot
+        self.db = db
+        self.guild_id = guild_id
+        self.target_channel = target_channel
+        self.user = user
+        
+        # Pagination state
+        self.page = 0
+        self.sounds_per_page = 24
+        self.all_sounds = []  # List of (name, sound_data) tuples
+        
+    async def initialize(self):
+        """Charge les sons disponibles."""
+        sounds = await self.db.get_available_sounds(str(self.guild_id))
+        self.all_sounds = sorted(sounds.items(), key=lambda x: x[0].lower())
+        self.update_components()
+        
+    def update_components(self):
+        """Met à jour les composants de la vue."""
+        self.clear_items()
+        
+        if not self.all_sounds:
+            options = [discord.SelectOption(label="Aucun son disponible", value="none", disabled=True)]
+            self.add_item(discord.ui.Select(
+                placeholder="Aucun son disponible",
+                custom_id="sound_select",
+                options=options,
+                row=0
+            ))
+        else:
+            # Calculate pagination
+            start_idx = self.page * self.sounds_per_page
+            end_idx = start_idx + self.sounds_per_page
+            page_sounds = self.all_sounds[start_idx:end_idx]
+            total_pages = (len(self.all_sounds) - 1) // self.sounds_per_page + 1
+            
+            # Build options - add Random option on first page
+            options = []
+            if self.page == 0:
+                options.append(discord.SelectOption(
+                    label="Random 🔥", 
+                    value="__random__", 
+                    description="🎲 Jouer un son aléatoire",
+                    emoji="🎲"
+                ))
+            
+            options.extend([
+                discord.SelectOption(label=name[:100], value=name, description=f"🎵 {data.get('play_count', 0)} lectures")
+                for name, data in page_sounds
+            ])
+            
+            self.add_item(discord.ui.Select(
+                placeholder=f"🎵 Choisir un son (Page {self.page + 1}/{total_pages})",
+                custom_id="sound_select",
+                options=options,
+                row=0
+            ))
+            
+            # Pagination buttons if needed
+            if total_pages > 1:
+                prev_btn = discord.ui.Button(
+                    label="◀️ Précédent",
+                    style=discord.ButtonStyle.secondary,
+                    custom_id="page_prev",
+                    disabled=self.page == 0,
+                    row=1
+                )
+                prev_btn.callback = self.page_prev_callback
+                self.add_item(prev_btn)
+                
+                info_btn = discord.ui.Button(
+                    label=f"Page {self.page + 1}/{total_pages}",
+                    style=discord.ButtonStyle.secondary,
+                    custom_id="page_info",
+                    disabled=True,
+                    row=1
+                )
+                self.add_item(info_btn)
+                
+                next_btn = discord.ui.Button(
+                    label="Suivant ▶️",
+                    style=discord.ButtonStyle.secondary,
+                    custom_id="page_next",
+                    disabled=self.page >= total_pages - 1,
+                    row=1
+                )
+                next_btn.callback = self.page_next_callback
+                self.add_item(next_btn)
+        
+        # Cancel button
+        cancel_btn = discord.ui.Button(
+            label="Annuler",
+            style=discord.ButtonStyle.danger,
+            custom_id="cancel",
+            row=2
+        )
+        cancel_btn.callback = self.cancel_callback
+        self.add_item(cancel_btn)
+    
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        """Vérifie que seul l'utilisateur original peut interagir."""
+        if interaction.user.id != self.user.id:
+            await interaction.response.send_message("❌ Ce menu n'est pas pour vous.", ephemeral=True)
+            return False
+        
+        # Handle sound selection
+        if interaction.data.get("custom_id") == "sound_select":
+            await self.handle_sound_selection(interaction)
+            return False
+        
+        return True
+    
+    def build_embed(self, last_played: str = None):
+        """Construit l'embed du sélecteur."""
+        total_pages = (len(self.all_sounds) - 1) // self.sounds_per_page + 1 if self.all_sounds else 1
+        
+        embed = discord.Embed(
+            title="🎵 Quel son voulez-vous jouer ?",
+            description=f"Sélectionnez un son dans la liste ci-dessous.\n"
+                        f"Le son sera joué dans {self.target_channel.mention}.\n\n"
+                        f"📊 **{len(self.all_sounds)}** son(s) disponible(s)",
+            color=discord.Color.blue()
+        )
+        
+        if last_played:
+            embed.add_field(
+                name="✅ Dernier son joué",
+                value=f"🎵 **{last_played}**",
+                inline=False
+            )
+        
+        embed.set_footer(text=f"⏱️ Ce menu expire dans 2 minutes • Page {self.page + 1}/{total_pages}")
+        return embed
+    
+    async def handle_sound_selection(self, interaction: discord.Interaction):
+        """Gère la sélection d'un son."""
+        sound_name = interaction.data["values"][0]
+        
+        if sound_name == "none":
+            return
+        
+        # Handle random selection
+        if sound_name == "__random__":
+            import random
+            if self.all_sounds:
+                sound_name, sound_data = random.choice(self.all_sounds)
+            else:
+                await interaction.response.send_message("❌ Aucun son disponible.", ephemeral=True)
+                return
+        else:
+            # Find the sound data
+            sound_data = None
+            for name, data in self.all_sounds:
+                if name == sound_name:
+                    sound_data = data
+                    break
+        
+        if not sound_data:
+            await interaction.response.send_message("❌ Son introuvable.", ephemeral=True)
+            return
+        
+        # Get file path
+        file_path = Config.get_sound_path(sound_data['guild_id'], sound_data['filename'])
+        
+        if not os.path.exists(file_path):
+            await interaction.response.send_message(f"❌ Fichier introuvable pour `{sound_name}`.", ephemeral=True)
+            return
+        
+        # Add to queue
+        player = self.bot.player_manager.get_player(self.guild_id)
+        position = player.add_to_queue(
+            file_path,
+            self.user.display_name,
+            sound_name,
+            self.target_channel
+        )
+        
+        # Increment play count
+        await self.db.increment_play_count(sound_data['guild_id'], sound_name)
+        
+        # Update embed with last played sound and keep the view
+        embed = self.build_embed(last_played=sound_name)
+        
+        # Confirmation in footer
+        if position == 1:
+            embed.set_footer(text=f"▶️ {sound_name} en lecture • Page {self.page + 1}/{((len(self.all_sounds) - 1) // self.sounds_per_page + 1)}")
+        else:
+            embed.set_footer(text=f"📋 {sound_name} ajouté (position {position}) • Page {self.page + 1}/{((len(self.all_sounds) - 1) // self.sounds_per_page + 1)}")
+        
+        await interaction.response.edit_message(embed=embed, view=self)
+    
+    async def page_prev_callback(self, interaction: discord.Interaction):
+        """Page précédente."""
+        self.page = max(0, self.page - 1)
+        self.update_components()
+        await interaction.response.edit_message(view=self)
+    
+    async def page_next_callback(self, interaction: discord.Interaction):
+        """Page suivante."""
+        max_pages = (len(self.all_sounds) - 1) // self.sounds_per_page
+        self.page = min(max_pages, self.page + 1)
+        self.update_components()
+        await interaction.response.edit_message(view=self)
+    
+    async def cancel_callback(self, interaction: discord.Interaction):
+        """Annule la sélection."""
+        await interaction.response.edit_message(content="❌ Sélection annulée.", embed=None, view=None)
+        self.stop()
+    
+    async def on_timeout(self):
+        """Appelé quand la vue expire."""
+        pass  # Le message sera nettoyé automatiquement
+
+
+class RenameSoundView(discord.ui.View):
+    """Vue de sélection de son avec pagination pour /rename_sound."""
+    
+    def __init__(self, bot, db, guild_id: int, user: discord.Member):
+        super().__init__(timeout=120)
+        self.bot = bot
+        self.db = db
+        self.guild_id = guild_id
+        self.user = user
+        
+        # Pagination state
+        self.page = 0
+        self.sounds_per_page = 25
+        self.all_sounds = []  # List of (name, sound_data) tuples
+        
+    async def initialize(self):
+        """Charge les sons disponibles."""
+        sounds = await self.db.get_available_sounds(str(self.guild_id))
+        self.all_sounds = sorted(sounds.items(), key=lambda x: x[0].lower())
+        self.update_components()
+        
+    def update_components(self):
+        """Met à jour les composants de la vue."""
+        self.clear_items()
+        
+        if not self.all_sounds:
+            options = [discord.SelectOption(label="Aucun son disponible", value="none", disabled=True)]
+            self.add_item(discord.ui.Select(
+                placeholder="Aucun son disponible",
+                custom_id="sound_select",
+                options=options,
+                row=0
+            ))
+        else:
+            # Calculate pagination
+            start_idx = self.page * self.sounds_per_page
+            end_idx = start_idx + self.sounds_per_page
+            page_sounds = self.all_sounds[start_idx:end_idx]
+            total_pages = (len(self.all_sounds) - 1) // self.sounds_per_page + 1
+            
+            # Build options
+            options = [
+                discord.SelectOption(label=name[:100], value=name, description=f"🎵 {data.get('play_count', 0)} lectures")
+                for name, data in page_sounds
+            ]
+            
+            self.add_item(discord.ui.Select(
+                placeholder=f"✏️ Choisir un son à renommer (Page {self.page + 1}/{total_pages})",
+                custom_id="sound_select",
+                options=options,
+                row=0
+            ))
+            
+            # Pagination buttons if needed
+            if total_pages > 1:
+                prev_btn = discord.ui.Button(
+                    label="◀️ Précédent",
+                    style=discord.ButtonStyle.secondary,
+                    custom_id="page_prev",
+                    disabled=self.page == 0,
+                    row=1
+                )
+                prev_btn.callback = self.page_prev_callback
+                self.add_item(prev_btn)
+                
+                info_btn = discord.ui.Button(
+                    label=f"Page {self.page + 1}/{total_pages}",
+                    style=discord.ButtonStyle.secondary,
+                    custom_id="page_info",
+                    disabled=True,
+                    row=1
+                )
+                self.add_item(info_btn)
+                
+                next_btn = discord.ui.Button(
+                    label="Suivant ▶️",
+                    style=discord.ButtonStyle.secondary,
+                    custom_id="page_next",
+                    disabled=self.page >= total_pages - 1,
+                    row=1
+                )
+                next_btn.callback = self.page_next_callback
+                self.add_item(next_btn)
+        
+        # Cancel button
+        cancel_btn = discord.ui.Button(
+            label="Annuler",
+            style=discord.ButtonStyle.danger,
+            custom_id="cancel",
+            row=2
+        )
+        cancel_btn.callback = self.cancel_callback
+        self.add_item(cancel_btn)
+    
+    def build_embed(self, selected_sound: str = None, renamed_to: str = None):
+        """Construit l'embed du sélecteur."""
+        total_pages = (len(self.all_sounds) - 1) // self.sounds_per_page + 1 if self.all_sounds else 1
+        
+        embed = discord.Embed(
+            title="✏️ Renommer un son",
+            description=f"Sélectionnez le son que vous souhaitez renommer.\n\n"
+                        f"📊 **{len(self.all_sounds)}** son(s) disponible(s)",
+            color=discord.Color.orange()
+        )
+        
+        if renamed_to:
+            embed.add_field(
+                name="✅ Son renommé",
+                value=f"**{selected_sound}** → **{renamed_to}**",
+                inline=False
+            )
+        
+        embed.set_footer(text=f"⏱️ Ce menu expire dans 2 minutes • Page {self.page + 1}/{total_pages}")
+        return embed
+    
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        """Vérifie que seul l'utilisateur original peut interagir."""
+        if interaction.user.id != self.user.id:
+            await interaction.response.send_message("❌ Ce menu n'est pas pour vous.", ephemeral=True)
+            return False
+        
+        # Handle sound selection
+        if interaction.data.get("custom_id") == "sound_select":
+            await self.handle_sound_selection(interaction)
+            return False
+        
+        return True
+    
+    async def handle_sound_selection(self, interaction: discord.Interaction):
+        """Gère la sélection d'un son - ouvre le modal de renommage."""
+        sound_name = interaction.data["values"][0]
+        
+        if sound_name == "none":
+            return
+        
+        # Open modal to get new name
+        modal = RenameSoundModal(self, sound_name)
+        await interaction.response.send_modal(modal)
+    
+    async def page_prev_callback(self, interaction: discord.Interaction):
+        """Page précédente."""
+        self.page = max(0, self.page - 1)
+        self.update_components()
+        embed = self.build_embed()
+        await interaction.response.edit_message(embed=embed, view=self)
+    
+    async def page_next_callback(self, interaction: discord.Interaction):
+        """Page suivante."""
+        max_pages = (len(self.all_sounds) - 1) // self.sounds_per_page
+        self.page = min(max_pages, self.page + 1)
+        self.update_components()
+        embed = self.build_embed()
+        await interaction.response.edit_message(embed=embed, view=self)
+    
+    async def cancel_callback(self, interaction: discord.Interaction):
+        """Annule la sélection."""
+        await interaction.response.edit_message(content="❌ Renommage annulé.", embed=None, view=None)
+        self.stop()
+    
+    async def on_timeout(self):
+        """Appelé quand la vue expire."""
+        pass
+
+
+class RenameSoundModal(discord.ui.Modal, title="Renommer le son"):
+    """Modal pour saisir le nouveau nom du son."""
+    
+    new_name = discord.ui.TextInput(
+        label="Nouveau nom",
+        placeholder="Entrez le nouveau nom du son...",
+        min_length=1,
+        max_length=100
+    )
+    
+    def __init__(self, view: RenameSoundView, old_name: str):
+        super().__init__()
+        self.view = view
+        self.old_name = old_name
+        self.new_name.default = old_name
+    
+    async def on_submit(self, interaction: discord.Interaction):
+        """Traite le renommage du son."""
+        new_name = self.new_name.value.strip()
+        
+        if not new_name:
+            await interaction.response.send_message("❌ Le nom ne peut pas être vide.", ephemeral=True)
+            return
+        
+        if new_name.lower() == self.old_name.lower():
+            await interaction.response.send_message("ℹ️ Le nom est identique, aucun changement.", ephemeral=True)
+            return
+        
+        # Try to rename
+        success = await self.view.db.rename_sound(str(self.view.guild_id), self.old_name, new_name)
+        
+        if success:
+            # Update the view's sound list
+            await self.view.initialize()
+            embed = self.view.build_embed(selected_sound=self.old_name, renamed_to=new_name)
+            await interaction.response.edit_message(embed=embed, view=self.view)
+        else:
+            await interaction.response.send_message(
+                f"❌ Un son nommé **{new_name}** existe déjà.", 
+                ephemeral=True
+            )
+
 
 class RoutinePanelView(discord.ui.View):
     def __init__(self, bot, db, guild_id):
@@ -744,6 +1791,11 @@ class RoutineCreationView(discord.ui.View):
         self.guild_id = guild_id
         self.routine_id = routine_id
         
+        # Sound pagination state
+        self.sound_page = 0
+        self.sounds_per_page = 24  # 24 + 1 pour le bouton "Plus"
+        self.all_sounds = []  # Cache des sons disponibles
+        
         # Data State
         if routine_data:
             self.name = routine_data['name']
@@ -878,7 +1930,10 @@ class RoutineCreationView(discord.ui.View):
         return f"{c['type']} {c['op']} {c['value']}"
 
     def format_action(self, a):
-        if a['type'] == 'play_sound': return f"Joue: {a['sound_name']}"
+        if a['type'] == 'play_sound':
+            if a['sound_name'] == '__random__':
+                return "🎲 Joue: Random 🔥"
+            return f"Joue: {a['sound_name']}"
         if a['type'] == 'wait': return f"Pause: {a['delay']}s"
         if a['type'] == 'message': return f"Msg: {a['content']}"
         return "Action"
@@ -889,7 +1944,13 @@ class RoutineCreationView(discord.ui.View):
             
             # Navigation
             if cid == "back":
-                self.mode = "main"
+                # If we're in sound selector, go back to actions mode
+                if self.all_sounds:
+                    self.mode = "actions"
+                    self.sound_page = 0
+                    self.all_sounds = []
+                else:
+                    self.mode = "main"
                 self.selected_index = None
             elif cid == "menu_triggers": self.mode = "triggers"
             elif cid == "menu_conditions": self.mode = "conditions"
@@ -942,15 +2003,22 @@ class RoutineCreationView(discord.ui.View):
 
             # Action Actions
             elif cid == "add_action_sound":
-                # Show sound selector
+                # Show paginated sound selector
                 sounds = await self.db.get_available_sounds(self.guild_id)
-                options = [discord.SelectOption(label=name, value=name) for name in sorted(sounds.keys())[:25]]
-                if not options: options = [discord.SelectOption(label="Aucun son", value="none", disabled=True)]
-                
-                # Replace view temporarily with sound selector
-                # Actually, let's just add a select to the current view
-                self.add_item(discord.ui.Select(placeholder="Choisir un son", custom_id="quick_select_sound", options=options))
-                await interaction.response.edit_message(view=self)
+                self.all_sounds = sorted(sounds.keys())
+                self.sound_page = 0
+                await self._show_sound_selector(interaction)
+                return False
+            elif cid == "sound_page_prev":
+                # Page précédente des sons
+                self.sound_page = max(0, self.sound_page - 1)
+                await self._show_sound_selector(interaction)
+                return False
+            elif cid == "sound_page_next":
+                # Page suivante des sons
+                max_pages = (len(self.all_sounds) - 1) // self.sounds_per_page
+                self.sound_page = min(max_pages, self.sound_page + 1)
+                await self._show_sound_selector(interaction)
                 return False
             elif cid == "add_action_wait":
                 await interaction.response.send_modal(WaitInputModal(self))
@@ -989,7 +2057,15 @@ class RoutineCreationView(discord.ui.View):
             elif cid == "quick_select_sound":
                 val = interaction.data["values"][0]
                 if val != "none":
-                    self.actions.append({"type": "play_sound", "sound_name": val, "target_strategy": "active"})
+                    # For random, store special marker that routine_manager will handle
+                    if val == "__random__":
+                        self.actions.append({"type": "play_sound", "sound_name": "__random__", "target_strategy": "active"})
+                    else:
+                        self.actions.append({"type": "play_sound", "sound_name": val, "target_strategy": "active"})
+                # Reset sound pagination state and return to actions menu
+                self.sound_page = 0
+                self.all_sounds = []
+                self.mode = "actions"
 
             self.update_components()
             await self.refresh_embed(interaction)
@@ -1196,6 +2272,84 @@ class RoutineCreationView(discord.ui.View):
         elif len(self.conditions) > 1:
             return {"type": self.condition_logic, "sub": self.conditions}
         return None
+
+    async def _show_sound_selector(self, interaction: discord.Interaction):
+        """Affiche le sélecteur de sons avec pagination."""
+        # Remove any existing sound selector
+        self.clear_items()
+        
+        if not self.all_sounds:
+            # No sounds available
+            options = [discord.SelectOption(label="Aucun son disponible", value="none", disabled=True)]
+            self.add_item(discord.ui.Select(
+                placeholder="Aucun son disponible", 
+                custom_id="quick_select_sound", 
+                options=options
+            ))
+        else:
+            # Calculate pagination
+            start_idx = self.sound_page * self.sounds_per_page
+            end_idx = start_idx + self.sounds_per_page
+            page_sounds = self.all_sounds[start_idx:end_idx]
+            total_pages = (len(self.all_sounds) - 1) // self.sounds_per_page + 1
+            
+            # Build options for current page - add Random option on first page
+            options = []
+            if self.sound_page == 0:
+                options.append(discord.SelectOption(
+                    label="Random 🔥", 
+                    value="__random__", 
+                    emoji="🎲"
+                ))
+            
+            options.extend([discord.SelectOption(label=name[:100], value=name) for name in page_sounds])
+            
+            self.add_item(discord.ui.Select(
+                placeholder=f"Choisir un son (Page {self.sound_page + 1}/{total_pages})", 
+                custom_id="quick_select_sound", 
+                options=options,
+                row=0
+            ))
+            
+            # Add pagination buttons if needed
+            if total_pages > 1:
+                prev_disabled = self.sound_page == 0
+                next_disabled = self.sound_page >= total_pages - 1
+                
+                self.add_item(discord.ui.Button(
+                    label="◀️ Précédent", 
+                    style=discord.ButtonStyle.secondary, 
+                    custom_id="sound_page_prev",
+                    disabled=prev_disabled,
+                    row=1
+                ))
+                self.add_item(discord.ui.Button(
+                    label=f"Page {self.sound_page + 1}/{total_pages}", 
+                    style=discord.ButtonStyle.secondary, 
+                    custom_id="sound_page_info",
+                    disabled=True,
+                    row=1
+                ))
+                self.add_item(discord.ui.Button(
+                    label="Suivant ▶️", 
+                    style=discord.ButtonStyle.secondary, 
+                    custom_id="sound_page_next",
+                    disabled=next_disabled,
+                    row=1
+                ))
+        
+        # Add back button
+        self.add_item(discord.ui.Button(
+            label="Annuler", 
+            style=discord.ButtonStyle.danger, 
+            custom_id="back",
+            row=2
+        ))
+        
+        if interaction.response.is_done():
+            await interaction.edit_original_response(view=self)
+        else:
+            await interaction.response.edit_message(view=self)
 
     async def refresh_embed(self, interaction: discord.Interaction):
         embed = discord.Embed(title=f"🛠️ {self.name}", color=discord.Color.blue())

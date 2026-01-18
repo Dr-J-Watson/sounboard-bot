@@ -18,6 +18,7 @@ __pycache__/
 
 # les sons
 sounds/*
+data/*
 
 # Fichiers de configuration utilisateur
 *.sqlite3
