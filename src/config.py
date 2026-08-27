@@ -35,11 +35,13 @@ class Config:
     DISCORD_TOKEN: str = os.getenv("DISCORD_TOKEN", "")
     
     # === Chemins des fichiers et dossiers ===
+    # Surchargeables par variables d'environnement (utile en conteneur, où
+    # les volumes ne sont pas forcément montés à côté du code).
     BASE_DIR: str = os.path.dirname(os.path.abspath(__file__))
     PROJECT_ROOT: str = os.path.dirname(BASE_DIR)
-    SOUNDS_DIR: str = os.path.join(PROJECT_ROOT, "sounds")
-    DATA_DIR: str = os.path.join(PROJECT_ROOT, "data")
-    DB_FILE: str = os.path.join(DATA_DIR, "soundboard.db")
+    SOUNDS_DIR: str = os.getenv("SOUNDS_DIR", os.path.join(PROJECT_ROOT, "sounds"))
+    DATA_DIR: str = os.getenv("DATA_DIR", os.path.join(PROJECT_ROOT, "data"))
+    DB_FILE: str = os.getenv("DB_FILE", os.path.join(DATA_DIR, "soundboard.db"))
 
     # === Configuration Audio ===
     MAX_DURATION_SECONDS: int = int(os.getenv("MAX_DURATION_SECONDS", "30"))
@@ -49,10 +51,23 @@ class Config:
     
     # === Configuration Bot ===
     VOICE_TIMEOUT_SECONDS: int = int(os.getenv("VOICE_TIMEOUT_SECONDS", "300"))  # 5 minutes par défaut
+    DEFAULT_VOLUME: int = int(os.getenv("DEFAULT_VOLUME", "70"))  # en % (0-200)
+    
+    # Intent privilégié "Server Members".
+    # Nécessaire pour que les conditions role= et guild.get_member() soient
+    # fiables. À activer aussi dans le portail développeur Discord, sinon la
+    # connexion est refusée : mettre MEMBERS_INTENT=false pour s'en passer.
+    MEMBERS_INTENT: bool = os.getenv("MEMBERS_INTENT", "true").lower() == "true"
+    
+    # Intent privilégié "Message Content".
+    # Requis uniquement pour le déclencheur de routine "on message <mot-clé>",
+    # qui ne verra que des messages vides sans lui. Comme MEMBERS_INTENT, il
+    # doit aussi être coché dans le portail développeur Discord.
+    MESSAGE_CONTENT_INTENT: bool = os.getenv("MESSAGE_CONTENT_INTENT", "false").lower() == "true"
     
     # === Configuration avancée ===
     DEBUG_MODE: bool = os.getenv("DEBUG_MODE", "false").lower() == "true"
-    LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO").upper()
+    LOG_LEVEL: str = os.getenv("LOG_LEVEL", "DEBUG" if DEBUG_MODE else "INFO").upper()
 
     @staticmethod
     def validate() -> None:
@@ -75,6 +90,9 @@ class Config:
         
         if Config.MAX_FILE_SIZE_MB < 0:
             raise ValueError("MAX_FILE_SIZE_MB doit être positif ou nul.")
+        
+        if not 0 <= Config.DEFAULT_VOLUME <= 200:
+            raise ValueError("DEFAULT_VOLUME doit être compris entre 0 et 200.")
         
         # Créer les dossiers s'ils n'existent pas
         os.makedirs(Config.SOUNDS_DIR, exist_ok=True)

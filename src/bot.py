@@ -14,8 +14,10 @@ Auteur: Soundboard Bot
 import discord
 from discord import app_commands
 from discord.ext import commands
+import asyncio
 import logging
 import os
+import re
 import sys
 from typing import Optional, List
 
@@ -24,7 +26,13 @@ from config import Config
 from database import DatabaseManager
 from audio_manager import AudioManager
 from player import PlayerManager
-from routine_manager import RoutineManager
+from routine_manager import (
+    RoutineManager,
+    format_duration,
+    parse_duration_seconds,
+    parse_duration_range,
+    WEEKDAYS,
+)
 
 # === Configuration du logging ===
 logging.basicConfig(
@@ -55,6 +63,17 @@ intents = discord.Intents.default()
 intents.voice_states = True  # Requis pour les routines vocales
 intents.guilds = True        # Requis pour la gestion des serveurs
 
+# Intent privilégié : sans lui, le cache des membres n'est alimenté que par
+# les événements vocaux, ce qui rend guild.get_member() et les conditions
+# role= peu fiables. Doit être activé dans le portail développeur Discord.
+if Config.MEMBERS_INTENT:
+    intents.members = True
+
+# Sans cet intent, message.content est vide : le déclencheur "on message"
+# ne peut rien détecter. Désactivé par défaut car privilégié lui aussi.
+if Config.MESSAGE_CONTENT_INTENT:
+    intents.message_content = True
+
 
 class SoundboardBot(commands.Bot):
     """
@@ -71,7 +90,7 @@ class SoundboardBot(commands.Bot):
     def __init__(self):
         """Initialise le bot avec les intents et les gestionnaires."""
         super().__init__(command_prefix="!", intents=intents)
-        self.player_manager = PlayerManager(self, Config.VOICE_TIMEOUT_SECONDS)
+        self.player_manager = PlayerManager(self, Config.VOICE_TIMEOUT_SECONDS, db)
         self.routine_manager = RoutineManager(self, db)
 
     async def setup_hook(self) -> None:
@@ -143,13 +162,54 @@ class SoundboardBot(commands.Bot):
         Gère les changements d'état vocal.
         
         Transmet les événements au gestionnaire de routines.
-        Détecte aussi quand le bot se retrouve seul dans un salon.
+        Détecte aussi quand le bot se retrouve seul dans un salon,
+        et quand le bot lui-même est déconnecté ou déplacé.
         """
-        # Vérifier si le bot se retrouve seul dans un salon
-        await self._check_bot_alone(member, before)
+        if member.id == self.user.id:
+            # Le bot a été déplacé ou déconnecté (manuellement ou non)
+            await self._handle_bot_voice_change(member, before, after)
+        else:
+            # Vérifier si le bot se retrouve seul dans un salon
+            await self._check_bot_alone(member, before)
         
         # Transmettre aux routines
         await self.routine_manager.on_voice_state_update(member, before, after)
+
+    async def _handle_bot_voice_change(
+        self,
+        member: discord.Member,
+        before: discord.VoiceState,
+        after: discord.VoiceState
+    ) -> None:
+        """
+        Réagit à un changement d'état vocal du bot lui-même.
+        
+        Déconnexion manuelle : on purge uniquement les sons destinés au salon
+        quitté (intention explicite d'un utilisateur), on resynchronise le
+        player puis on relance la file pour les autres salons.
+        
+        Déplacement manuel : on se contente de resynchroniser le client vocal.
+        """
+        if before.channel is None:
+            return
+        
+        player = self.player_manager.find_player(member.guild.id)
+        if player is None:
+            return
+        
+        if after.channel is None:
+            logger.info(f"👋 Bot déconnecté de {before.channel.name}")
+            
+            player.purge_channel(before.channel.id)
+            player.current_sound = None
+            player.voice_client = None
+            
+            # Les sons destinés aux autres salons doivent continuer
+            asyncio.create_task(player.process_next())
+        
+        elif after.channel.id != before.channel.id:
+            logger.info(f"↔️ Bot déplacé vers {after.channel.name}")
+            player.voice_client = member.guild.voice_client
 
     async def _check_bot_alone(
         self,
@@ -179,14 +239,66 @@ class SoundboardBot(commands.Bot):
         if len(human_members) == 0:
             logger.info(f"🚶 Bot seul dans {before.channel.name}, arrêt et déconnexion")
             
-            # Arrêter le player de ce serveur
-            guild_id = str(member.guild.id)
-            if guild_id in self.player_manager.players:
-                player = self.player_manager.players[guild_id]
-                player.stop()  # Arrête la lecture et vide la queue
-            
-            # Déconnecter immédiatement
-            await voice_client.disconnect(force=True)
+            # La file d'attente est conservée : elle peut contenir des sons
+            # destinés à d'autres salons. Ceux visant un salon resté vide
+            # seront écartés au moment de les jouer par process_next().
+            player = self.player_manager.find_player(member.guild.id)
+            if player is not None:
+                await player.leave()
+            else:
+                await voice_client.disconnect(force=True)
+
+    async def on_message(self, message: discord.Message) -> None:
+        """Transmet les messages aux routines (déclencheur par mot-clé)."""
+        if message.author.bot or message.guild is None:
+            return
+        
+        await self.routine_manager.on_message(message)
+        await self.process_commands(message)
+
+    async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent) -> None:
+        """
+        Transmet les réactions aux routines.
+        
+        La variante « raw » est utilisée pour capter aussi les réactions sur
+        des messages absents du cache (redémarrage, anciens messages).
+        """
+        if payload.guild_id is None:
+            return
+        
+        guild = self.get_guild(payload.guild_id)
+        if guild is None:
+            return
+        
+        member = payload.member or guild.get_member(payload.user_id)
+        if member is None or member.bot:
+            return
+        
+        channel = guild.get_channel(payload.channel_id)
+        await self.routine_manager.on_reaction(str(payload.emoji), member, channel)
+
+    async def on_guild_remove(self, guild: discord.Guild) -> None:
+        """
+        Appelé quand le bot est retiré d'un serveur.
+        
+        Nettoie le player et toutes les données du serveur en base, pour ne
+        pas laisser de sons, routines et salons ignorés orphelins.
+        Les fichiers audio du serveur sont conservés sur le disque.
+        """
+        logger.info(f"👋 Bot retiré du serveur {guild.name} ({guild.id})")
+        
+        player = self.player_manager.find_player(guild.id)
+        if player is not None:
+            player.queue.clear()
+            await player.disconnect()
+            self.player_manager.players.pop(guild.id, None)
+        
+        try:
+            await db.delete_guild_data(str(guild.id))
+        except Exception as e:
+            logger.error(f"Erreur lors du nettoyage des données de {guild.id}: {e}")
+        
+        await self.routine_manager.load_routines()
 
     async def close(self) -> None:
         """Nettoyage lors de l'arrêt du bot."""
@@ -198,11 +310,130 @@ class SoundboardBot(commands.Bot):
         # Déconnecter tous les players
         await self.player_manager.disconnect_all()
         
+        # Fermer la connexion à la base
+        await db.close()
+        
         await super().close()
+
+
+def describe_action(action: dict) -> str:
+    """
+    Décrit une action de routine en une ligne lisible.
+
+    Args:
+        action: Dictionnaire d'action
+
+    Returns:
+        Description courte de l'action
+    """
+    a_type = action.get('type')
+
+    if a_type == 'play_sound':
+        name = action.get('sound_name')
+        return "🎲 son aléatoire" if name == '__random__' else f"🎵 {name}"
+    if a_type == 'wait':
+        if action.get('delay_min') is not None:
+            return (f"💤 pause {format_duration(action['delay_min'])}"
+                    f"-{format_duration(action['delay_max'])}")
+        return f"💤 pause {format_duration(action.get('delay', 0))}"
+    if a_type == 'message':
+        return "💬 message"
+    if a_type == 'dm':
+        return "📩 message privé"
+    if a_type == 'chance':
+        return f"🎲 chance {action.get('percent')}%"
+    if a_type == 'volume':
+        value = action.get('value')
+        return "🔊 volume reset" if value == 'reset' else f"🔊 volume {value}%"
+    if a_type == 'move':
+        return "↔️ déplacer " + ("le membre" if action.get('target') == 'member' else "le bot")
+    if a_type == 'player_control':
+        labels = {'stop': '⏹️ stop', 'skip': '⏭️ skip',
+                  'clear': '🧹 vider la file', 'leave': '🚪 quitter le salon'}
+        return labels.get(action.get('command'), 'contrôle')
+    return str(a_type)
+
+
+def describe_trigger(trigger_type: str, trigger_data: dict) -> str:
+    """
+    Décrit un déclencheur de routine en une ligne lisible.
+
+    Args:
+        trigger_type: Type du déclencheur (timer, schedule, event)
+        trigger_data: Données associées
+
+    Returns:
+        Description courte, préfixée d'un émoji
+    """
+    if trigger_type == 'timer':
+        seconds = trigger_data.get('interval_seconds', 0)
+        if not seconds:
+            seconds = trigger_data.get('interval_minutes', 0) * 60
+        return f"⏰ Timer ({format_duration(seconds)})"
+
+    if trigger_type == 'schedule':
+        days = trigger_data.get('days') or []
+        day_names = ["lun", "mar", "mer", "jeu", "ven", "sam", "dim"]
+        when = ",".join(day_names[d] for d in days) if days else "tous les jours"
+        return f"🕐 À {trigger_data.get('time')} ({when})"
+
+    event = trigger_data.get('event', '?')
+    if event == 'voice_count_reached':
+        return f"👥 {trigger_data.get('count', '?')} membres dans le salon"
+    if event == 'voice_first_join':
+        return "🥇 Premier arrivé dans un salon vide"
+    if event == 'message':
+        return f"💬 Message contenant « {trigger_data.get('keyword', '')} »"
+    if event == 'reaction':
+        return f"⭐ Réaction {trigger_data.get('emoji', '')}"
+    return f"⚡ {event.replace('voice_', '')}"
 
 
 # === Instance du bot ===
 bot = SoundboardBot()
+
+
+@bot.tree.error
+async def on_app_command_error(
+    interaction: discord.Interaction,
+    error: app_commands.AppCommandError
+) -> None:
+    """
+    Gestionnaire global d'erreurs pour les commandes slash.
+    
+    Sans lui, une exception non rattrapée dans une commande se traduit par
+    « L'application n'a pas répondu » côté utilisateur, sans trace exploitable
+    côté serveur.
+    """
+    command_name = interaction.command.name if interaction.command else "inconnue"
+    
+    # Erreurs attendues : message clair, pas de stacktrace
+    if isinstance(error, app_commands.CommandOnCooldown):
+        message = f"⏳ Trop rapide, réessayez dans {error.retry_after:.0f}s."
+        logger.debug(f"Cooldown sur /{command_name}")
+    elif isinstance(error, (app_commands.MissingPermissions, app_commands.CheckFailure)):
+        message = "🚫 Vous n'avez pas les permissions nécessaires."
+        logger.debug(f"Permission refusée sur /{command_name} pour {interaction.user}")
+    else:
+        message = (
+            "❌ Une erreur est survenue lors de l'exécution de la commande. "
+            "L'incident a été enregistré."
+        )
+        logger.error(
+            f"Erreur non gérée dans /{command_name} "
+            f"(user={interaction.user}, guild={interaction.guild_id}): {error}",
+            exc_info=error
+        )
+    
+    # La réponse peut déjà avoir été envoyée ou différée
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
+    except discord.HTTPException:
+        pass  # L'interaction a expiré, rien de plus à faire
+
 
 
 # =============================================================================
@@ -223,9 +454,12 @@ async def help_command(interaction: discord.Interaction) -> None:
         name="🎵 Sons",
         value=(
             "`/play <nom>` : Joue un son\n"
-            "`/stop` : Arrête la lecture\n"
+            "`/stop` : Arrête la lecture et vide la file\n"
             "`/skip` : Passe au son suivant\n"
+            "`/queue` : Affiche la file d'attente\n"
+            "`/clear [salon]` : Vide la file sans couper le son en cours\n"
             "`/list_sounds` : Liste les sons disponibles\n"
+            "`/stats` : Classement des sons les plus joués\n"
             "`/add_sound <fichier> [nom]` : Ajoute un son"
         ),
         inline=False
@@ -236,8 +470,10 @@ async def help_command(interaction: discord.Interaction) -> None:
         name="⚙️ Administration",
         value=(
             "`/config <setting> <value>` : Configure les limites\n"
+            "`/volume [0-200]` : Règle le volume de lecture\n"
             "`/delete_sound <nom>` : Supprime un son\n"
-            "`/sync` : Synchronise les fichiers du disque"
+            "`/sync` : Synchronise les fichiers du disque\n"
+            "`/cleanup` : Nettoie les fichiers et entrées orphelins"
         ),
         inline=False
     )
@@ -255,25 +491,53 @@ async def help_command(interaction: discord.Interaction) -> None:
         inline=False
     )
     
-    # Syntaxe Routine
-    routine_help = (
-        "**Syntaxe :** `<trigger> [if <conditions>] do <actions>`\n\n"
-        "**Triggers (Déclencheurs) :**\n"
-        "• `timer 30s` / `5m` / `1h`\n"
-        "• `on join` / `leave` / `move`\n\n"
-        "**Conditions (Optionnel) :**\n"
-        "• `user=ID` • `channel=ID`\n"
-        "• `role=ID` • `time=18:00-23:00`\n"
-        "*(Séparer par `and`)*\n\n"
-        "**Actions :**\n"
-        "• `play <nom_son>`\n"
-        "• `wait <durée>`\n"
-        "*(Séparer par `then`)*\n\n"
-        "**Exemple :**\n"
-        "`timer 10m do play alerte`\n"
-        "`on join if user=123 do wait 2s then play bienvenue`"
+    # Syntaxe Routine — déclencheurs
+    embed.add_field(
+        name="📝 Routines : déclencheurs",
+        value=(
+            "**Syntaxe :** `<trigger> [if <conditions>] do <actions>`\n"
+            "• `timer 30s` / `5m` / `1h30m` — à intervalle régulier\n"
+            "• `at 18:00` / `at lun,ven 09:30` — à heure fixe\n"
+            "• `on join` / `leave` / `move` / `first_join`\n"
+            "• `on mute` / `unmute` / `deafen` / `undeafen`\n"
+            "• `on stream` / `stream_stop` / `video` / `video_stop`\n"
+            "• `on count>=3` — le salon atteint 3 membres\n"
+            "• `on message <mot-clé>` • `on reaction <émoji>`"
+        ),
+        inline=False
     )
-    embed.add_field(name="📝 Syntaxe des Routines", value=routine_help, inline=False)
+    
+    # Syntaxe Routine — conditions et actions
+    embed.add_field(
+        name="📝 Routines : conditions et actions",
+        value=(
+            "**Conditions** *(optionnel, séparées par `and`)* :\n"
+            "• `user=ID` • `channel=ID` • `role=ID` *(listes: `user=1,2`)*\n"
+            "• `time=18:00-23:00` • `date=01/12-25/12` • `day=lun,ven`\n"
+            "• `count>=3` • `chance=30` • `playing=false`\n\n"
+            "**Actions** *(séparées par `then`)* :\n"
+            "• `play <son>` • `wait 1m20s` • `wait 1m20s-2h` *(aléatoire)*\n"
+            "• `chance 25%` — interrompt la suite si le tirage échoue\n"
+            "• `stop` • `skip` • `clear` • `leave` *(quitte le vocal)*\n"
+            "• `volume 150` • `volume reset`\n"
+            "• `move <id_salon>` • `move member <id_salon>`\n"
+            "• `msg <texte>` • `dm <texte>`"
+        ),
+        inline=False
+    )
+    
+    embed.add_field(
+        name="💡 Exemples",
+        value=(
+            "`at 18:00 do play apero`\n"
+            "`on first_join do play intro`\n"
+            "`on count>=4 do play foule`\n"
+            "`on join if chance=25 and playing=false do play rare`\n"
+            "`on join do wait 10s-2m then play surprise`\n"
+            "`on leave do stop then leave`"
+        ),
+        inline=False
+    )
     
     embed.set_footer(text="💡 Utilisez /routine_create pour un assistant interactif !")
     
@@ -371,6 +635,16 @@ async def play(
             )
             return
 
+    # Vérifier que le bot peut réellement jouer dans ce salon
+    permissions = target_channel.permissions_for(interaction.guild.me)
+    if not permissions.connect or not permissions.speak:
+        await interaction.response.send_message(
+            f"🚫 Je n'ai pas la permission de me connecter ou de parler dans "
+            f"{target_channel.mention}.",
+            ephemeral=True
+        )
+        return
+
     # Vérifier si le salon est ignoré
     if await db.is_channel_ignored(str(interaction.guild_id), str(target_channel.id)):
         await interaction.response.send_message(
@@ -432,8 +706,10 @@ async def play(
     # Incrémenter le compteur de lecture
     await db.increment_play_count(sound_data['guild_id'], sound_name)
     
-    # Message de confirmation
-    if position == 1:
+    # Message de confirmation : position == 1 signifie "premier de la file",
+    # pas "en cours de lecture" (un autre son peut déjà être joué).
+    info = player.get_queue_info()
+    if position == 1 and not info['is_playing']:
         msg = f"🎵 **{sound_name}** en lecture dans {target_channel.mention}"
     else:
         msg = f"🎵 **{sound_name}** ajouté à la file (position {position}) dans {target_channel.mention}"
@@ -492,7 +768,7 @@ async def queue(interaction: discord.Interaction) -> None:
     
     if info['queue']:
         queue_text = "\n".join([
-            f"{i+1}. `{item['name']}` (par {item['requester']})"
+            f"{i+1}. `{item['name']}` → #{item['channel']} (par {item['requester']})"
             for i, item in enumerate(info['queue'][:10])
         ])
         if len(info['queue']) > 10:
@@ -504,6 +780,44 @@ async def queue(interaction: discord.Interaction) -> None:
     embed.set_footer(text=f"Connecté: {'Oui' if info['is_connected'] else 'Non'}")
     
     await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="clear", description="Vide la file d'attente sans couper le son en cours.")
+@app_commands.describe(
+    salon="Ne retirer que les sons destinés à ce salon (toute la file par défaut)."
+)
+async def clear(
+    interaction: discord.Interaction,
+    salon: Optional[discord.VoiceChannel] = None
+) -> None:
+    """
+    Vide la file d'attente.
+    
+    Contrairement à /stop, le son en cours n'est pas interrompu.
+    L'option `salon` permet de ne retirer que les sons visant un salon
+    précis, les autres restant en attente.
+    """
+    if not interaction.guild_id:
+        return
+    
+    player = bot.player_manager.get_player(interaction.guild_id)
+    
+    if salon is not None:
+        removed = player.purge_channel(salon.id)
+        cible = f" destiné(s) à {salon.mention}"
+    else:
+        removed = player.clear_queue()
+        cible = ""
+    
+    if removed == 0:
+        message = f"ℹ️ Aucun son en attente{cible}."
+    else:
+        message = f"🧹 {removed} son(s){cible} retiré(s) de la file."
+        if player.current_sound:
+            message += f"\n▶️ `{player.current_sound[0]}` continue (utilise `/skip` ou `/stop`)."
+    
+    await interaction.response.send_message(message, ephemeral=True)
+
 
 @bot.tree.command(name="add_sound", description="Ajoute un nouveau son au serveur.")
 @app_commands.describe(
@@ -760,6 +1074,176 @@ async def sync(interaction: discord.Interaction) -> None:
 
 
 # =============================================================================
+# COMMANDES STATISTIQUES ET MAINTENANCE
+# =============================================================================
+
+@bot.tree.command(name="stats", description="Affiche les statistiques de lecture des sons.")
+@app_commands.describe(limite="Nombre de sons à afficher dans le classement (3-25).")
+async def stats(interaction: discord.Interaction, limite: Optional[int] = 10) -> None:
+    """Affiche le classement des sons les plus joués."""
+    if not interaction.guild_id:
+        await interaction.response.send_message(
+            "❌ Commande serveur uniquement.",
+            ephemeral=True
+        )
+        return
+
+    limite = max(3, min(25, limite or 10))
+
+    await interaction.response.defer(ephemeral=True)
+    data = await db.get_stats(str(interaction.guild_id), limite)
+
+    embed = discord.Embed(title="📊 Statistiques du soundboard", color=discord.Color.blurple())
+    embed.add_field(name="Sons disponibles", value=str(data['total_sounds']), inline=True)
+    embed.add_field(name="Lectures totales", value=str(data['total_plays']), inline=True)
+
+    played = [s for s in data['top'] if s['plays'] > 0]
+    if played:
+        medals = ["🥇", "🥈", "🥉"]
+        lines = []
+        for i, sound in enumerate(played):
+            rank = medals[i] if i < len(medals) else f"`{i + 1}.`"
+            suffix = " 🌍" if sound['global'] else ""
+            lines.append(f"{rank} **{sound['name']}**{suffix} — {sound['plays']} lecture(s)")
+        embed.add_field(name=f"🏆 Top {len(played)}", value="\n".join(lines), inline=False)
+    else:
+        embed.add_field(
+            name="🏆 Classement",
+            value="*Aucun son n'a encore été joué.*",
+            inline=False
+        )
+
+    embed.set_footer(text="🌍 = son global, partagé entre les serveurs")
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="volume", description="Affiche ou modifie le volume de lecture du bot.")
+@app_commands.describe(pourcentage="Nouveau volume entre 0 et 200 (Admin). Laisser vide pour consulter.")
+async def volume(interaction: discord.Interaction, pourcentage: Optional[int] = None) -> None:
+    """Consulte ou règle le volume de lecture du serveur."""
+    if not interaction.guild_id:
+        await interaction.response.send_message(
+            "❌ Commande serveur uniquement.",
+            ephemeral=True
+        )
+        return
+
+    player = bot.player_manager.get_player(interaction.guild_id)
+
+    # Simple consultation
+    if pourcentage is None:
+        current = await player.get_volume()
+        await interaction.response.send_message(
+            f"🔊 Volume actuel : **{round(current * 100)}%**",
+            ephemeral=True
+        )
+        return
+
+    # Modification : réservée aux admins
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message(
+            "🚫 Réservé aux administrateurs pour modifier le volume.",
+            ephemeral=True
+        )
+        return
+
+    if not 0 <= pourcentage <= 200:
+        await interaction.response.send_message(
+            "❌ Le volume doit être compris entre 0 et 200.",
+            ephemeral=True
+        )
+        return
+
+    await db.set_config(str(interaction.guild_id), "volume", pourcentage)
+    applied = player.set_volume(pourcentage)
+
+    note = "\n⚠️ Au-dessus de 100%, le son peut saturer." if pourcentage > 100 else ""
+    await interaction.response.send_message(
+        f"🔊 Volume réglé sur **{round(applied * 100)}%**.{note}",
+        ephemeral=True
+    )
+
+
+@bot.tree.command(name="cleanup", description="Nettoie les fichiers et entrées orphelins (Admin).")
+async def cleanup(interaction: discord.Interaction) -> None:
+    """
+    Réconcilie la base et le disque.
+    
+    - Entrées en base dont le fichier a disparu : supprimées
+    - Fichiers sur le disque absents de la base : signalés (`/sync` les ajoute)
+    """
+    if not interaction.guild_id:
+        await interaction.response.send_message(
+            "❌ Commande serveur uniquement.",
+            ephemeral=True
+        )
+        return
+
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message(
+            "🚫 Réservé aux administrateurs.",
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    guild_id = str(interaction.guild_id)
+    guild_dir = os.path.join(Config.SOUNDS_DIR, guild_id)
+
+    # Fichiers réellement présents sur le disque
+    try:
+        on_disk = {
+            f for f in os.listdir(guild_dir)
+            if os.path.splitext(f)[1].lower() in Config.ALLOWED_EXTENSIONS
+        }
+    except FileNotFoundError:
+        on_disk = set()
+
+    # Entrées en base
+    in_db = await db.get_filenames(guild_id)
+
+    # Entrées sans fichier -> suppression
+    missing = [filename for filename in in_db if filename not in on_disk]
+    removed = await db.remove_sounds_by_filenames(guild_id, missing)
+
+    # Fichiers sans entrée -> simple signalement
+    orphan_files = sorted(on_disk - set(in_db))
+
+    embed = discord.Embed(title="🧹 Nettoyage", color=discord.Color.green())
+
+    if removed:
+        names = ", ".join(f"`{in_db[f]}`" for f in missing[:15])
+        if len(missing) > 15:
+            names += f" … (+{len(missing) - 15})"
+        embed.add_field(
+            name=f"🗑️ {removed} entrée(s) sans fichier supprimée(s)",
+            value=names,
+            inline=False
+        )
+    else:
+        embed.add_field(
+            name="🗑️ Entrées sans fichier",
+            value="*Aucune*",
+            inline=False
+        )
+
+    if orphan_files:
+        listing = "\n".join(f"`{f}`" for f in orphan_files[:10])
+        if len(orphan_files) > 10:
+            listing += f"\n… (+{len(orphan_files) - 10})"
+        embed.add_field(
+            name=f"📂 {len(orphan_files)} fichier(s) non référencé(s)",
+            value=f"{listing}\n\nUtilisez `/sync` pour les ajouter au soundboard.",
+            inline=False
+        )
+    else:
+        embed.add_field(name="📂 Fichiers non référencés", value="*Aucun*", inline=False)
+
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+# =============================================================================
 # COMMANDES SALONS IGNORÉS
 # =============================================================================
 
@@ -900,16 +1384,7 @@ async def routine_list(interaction: discord.Interaction) -> None:
         status = "✅" if r['active'] else "❌"
         
         # Description du trigger
-        if r['trigger_type'] == 'timer':
-            interval = r['trigger_data'].get('interval_minutes', 0)
-            if interval == 0:
-                interval = f"{r['trigger_data'].get('interval_seconds', 0)}s"
-            else:
-                interval = f"{interval}m"
-            trigger_desc = f"⏰ Timer ({interval})"
-        else:
-            event_name = r['trigger_data'].get('event', '?')
-            trigger_desc = f"⚡ {event_name.replace('voice_', '')}"
+        trigger_desc = describe_trigger(r['trigger_type'], r['trigger_data'])
         
         # Nombre d'actions
         actions_count = len(r['actions'])
@@ -961,7 +1436,7 @@ async def routine_delete(interaction: discord.Interaction, routine_id: int) -> N
         )
         return
 
-    deleted = await db.delete_routine(routine_id)
+    deleted = await db.delete_routine(routine_id, str(interaction.guild_id))
     
     if deleted:
         await bot.routine_manager.load_routines()
@@ -991,7 +1466,7 @@ async def routine_toggle(interaction: discord.Interaction, routine_id: int) -> N
         )
         return
 
-    new_state = await db.toggle_routine(routine_id)
+    new_state = await db.toggle_routine(routine_id, str(interaction.guild_id))
     
     if new_state is not None:
         await bot.routine_manager.load_routines()
@@ -1471,7 +1946,7 @@ class RoutinePanelView(discord.ui.View):
     async def toggle_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not self.selected_routine_id: return
         
-        new_state = await self.db.toggle_routine(self.selected_routine_id)
+        new_state = await self.db.toggle_routine(self.selected_routine_id, str(self.guild_id))
         await self.bot.routine_manager.load_routines()
         await self.refresh_view(interaction)
 
@@ -1493,7 +1968,7 @@ class RoutinePanelView(discord.ui.View):
     async def delete_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not self.selected_routine_id: return
         
-        await self.db.delete_routine(self.selected_routine_id)
+        await self.db.delete_routine(self.selected_routine_id, str(self.guild_id))
         await self.bot.routine_manager.load_routines()
         self.selected_routine_id = None
         await self.refresh_view(interaction)
@@ -1542,15 +2017,11 @@ class RoutinePanelView(discord.ui.View):
                 # Trigger
                 t_type = selected_routine['trigger_type']
                 t_data = selected_routine['trigger_data']
-                if t_type == 'timer':
-                    interval = t_data.get('interval_minutes', 0)
-                    if interval == 0:
-                         interval = f"{t_data.get('interval_seconds')} sec"
-                    else:
-                         interval = f"{interval} min"
-                    embed.add_field(name="Trigger", value=f"⏰ Timer ({interval})", inline=True)
-                else:
-                    embed.add_field(name="Trigger", value=f"⚡ Event ({t_data.get('event')})", inline=True)
+                embed.add_field(
+                    name="Trigger",
+                    value=describe_trigger(t_type, t_data),
+                    inline=True
+                )
                 
                 # Conditions
                 conds = selected_routine.get('conditions')
@@ -1867,8 +2338,11 @@ class RoutineCreationView(discord.ui.View):
 
         elif self.mode == "triggers":
             # Trigger Management
-            self.add_item(discord.ui.Button(label="Ajouter Timer", style=discord.ButtonStyle.success, custom_id="add_timer", emoji="⏰", row=0))
-            self.add_item(discord.ui.Button(label="Ajouter Event", style=discord.ButtonStyle.success, custom_id="add_event", emoji="📥", row=0))
+            self.add_item(discord.ui.Button(label="Timer", style=discord.ButtonStyle.success, custom_id="add_timer", emoji="⏰", row=0))
+            self.add_item(discord.ui.Button(label="Heure fixe", style=discord.ButtonStyle.success, custom_id="add_schedule", emoji="🕐", row=0))
+            self.add_item(discord.ui.Button(label="Event", style=discord.ButtonStyle.success, custom_id="add_event", emoji="📥", row=0))
+            self.add_item(discord.ui.Button(label="Nb membres", style=discord.ButtonStyle.success, custom_id="add_count", emoji="👥", row=0))
+            self.add_item(discord.ui.Button(label="Mot-clé / Réaction", style=discord.ButtonStyle.success, custom_id="add_keyword", emoji="💬", row=4))
             
             # Selection for deletion/move
             if self.triggers:
@@ -1925,6 +2399,10 @@ class RoutineCreationView(discord.ui.View):
             self.add_item(discord.ui.Button(label="Son", style=discord.ButtonStyle.success, custom_id="add_action_sound", emoji="🎵", row=0))
             self.add_item(discord.ui.Button(label="Pause", style=discord.ButtonStyle.success, custom_id="add_action_wait", emoji="💤", row=0))
             self.add_item(discord.ui.Button(label="Message", style=discord.ButtonStyle.success, custom_id="add_action_msg", emoji="💬", row=0))
+            self.add_item(discord.ui.Button(label="Chance", style=discord.ButtonStyle.success, custom_id="add_action_chance", emoji="🎲", row=0))
+            self.add_item(discord.ui.Button(label="Volume", style=discord.ButtonStyle.success, custom_id="add_action_volume", emoji="🔊", row=0))
+            self.add_item(discord.ui.Button(label="Contrôle", style=discord.ButtonStyle.primary, custom_id="add_action_control", emoji="🎛️", row=4))
+            self.add_item(discord.ui.Button(label="Déplacer", style=discord.ButtonStyle.primary, custom_id="add_action_move", emoji="↔️", row=4))
 
             if self.actions:
                 options = []
@@ -1942,7 +2420,12 @@ class RoutineCreationView(discord.ui.View):
 
     def format_trigger(self, t):
         if t['type'] == 'timer':
-            return f"⏰ Timer: {t['data'].get('interval_seconds')}s"
+            return f"⏰ Timer: {format_duration(t['data'].get('interval_seconds', 0))}"
+        elif t['type'] == 'schedule':
+            days = t['data'].get('days') or []
+            day_names = ["lun", "mar", "mer", "jeu", "ven", "sam", "dim"]
+            when = ",".join(day_names[d] for d in days) + " " if days else ""
+            return f"🕐 À {when}{t['data'].get('time')}"
         elif t['type'] == 'event':
             event = t['data'].get('event', '')
             event_labels = {
@@ -1956,7 +2439,11 @@ class RoutineCreationView(discord.ui.View):
                 'voice_stream_start': '📺 Stream Start',
                 'voice_stream_stop': '📵 Stream Stop',
                 'voice_video_start': '📹 Vidéo Start',
-                'voice_video_stop': '📷 Vidéo Stop'
+                'voice_video_stop': '📷 Vidéo Stop',
+                'voice_first_join': '🥇 Premier arrivé',
+                'voice_count_reached': f"👥 {t['data'].get('count', '?')} membres",
+                'message': f"💬 Mot-clé « {t['data'].get('keyword', '')} »",
+                'reaction': f"⭐ Réaction {t['data'].get('emoji', '')}"
             }
             return f"Event: {event_labels.get(event, event)}"
         return "Inconnu"
@@ -1969,8 +2456,23 @@ class RoutineCreationView(discord.ui.View):
             if a['sound_name'] == '__random__':
                 return "🎲 Joue: Random 🔥"
             return f"Joue: {a['sound_name']}"
-        if a['type'] == 'wait': return f"Pause: {a['delay']}s"
+        if a['type'] == 'wait':
+            if a.get('delay_min') is not None:
+                return f"Pause: {format_duration(a['delay_min'])}-{format_duration(a['delay_max'])}"
+            return f"Pause: {format_duration(a.get('delay', 0))}"
         if a['type'] == 'message': return f"Msg: {a['content']}"
+        if a['type'] == 'dm': return f"MP: {a['content']}"
+        if a['type'] == 'chance': return f"🎲 Chance: {a.get('percent')}%"
+        if a['type'] == 'volume':
+            value = a.get('value')
+            return "🔊 Volume: reset" if value == 'reset' else f"🔊 Volume: {value}%"
+        if a['type'] == 'move':
+            cible = "membre" if a.get('target') == 'member' else "bot"
+            return f"↔️ Déplacer {cible}"
+        if a['type'] == 'player_control':
+            labels = {'stop': '⏹️ Stop', 'skip': '⏭️ Skip',
+                      'clear': '🧹 Vider la file', 'leave': '🚪 Quitter le salon'}
+            return labels.get(a.get('command'), 'Contrôle')
         return "Action"
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
@@ -2006,9 +2508,19 @@ class RoutineCreationView(discord.ui.View):
             elif cid == "add_timer":
                 await interaction.response.send_modal(TimeInputModal(self))
                 return False
+            elif cid == "add_schedule":
+                await interaction.response.send_modal(ScheduleInputModal(self))
+                return False
+            elif cid == "add_count":
+                await interaction.response.send_modal(CountInputModal(self))
+                return False
+            elif cid == "add_keyword":
+                await interaction.response.send_modal(KeywordInputModal(self))
+                return False
             elif cid == "add_event":
                 # Quick select for event
                 self.add_item(discord.ui.Select(placeholder="Choisir l'événement", custom_id="quick_select_event", options=[
+                    discord.SelectOption(label="🥇 Premier arrivé", value="voice_first_join", description="Le premier humain dans un salon vide"),
                     discord.SelectOption(label="🟢 Join Vocal", value="voice_join", description="Quand quelqu'un rejoint un salon"),
                     discord.SelectOption(label="🔴 Leave Vocal", value="voice_leave", description="Quand quelqu'un quitte un salon"),
                     discord.SelectOption(label="🔀 Move Vocal", value="voice_move", description="Quand quelqu'un change de salon"),
@@ -2070,6 +2582,24 @@ class RoutineCreationView(discord.ui.View):
             elif cid == "add_action_msg":
                 await interaction.response.send_modal(MessageInputModal(self))
                 return False
+            elif cid == "add_action_chance":
+                await interaction.response.send_modal(ChanceInputModal(self))
+                return False
+            elif cid == "add_action_volume":
+                await interaction.response.send_modal(VolumeInputModal(self))
+                return False
+            elif cid == "add_action_move":
+                await interaction.response.send_modal(MoveInputModal(self))
+                return False
+            elif cid == "add_action_control":
+                self.add_item(discord.ui.Select(placeholder="Choisir un contrôle", custom_id="quick_select_control", options=[
+                    discord.SelectOption(label="⏹️ Stop", value="stop", description="Arrête la lecture et vide la file"),
+                    discord.SelectOption(label="⏭️ Skip", value="skip", description="Passe au son suivant"),
+                    discord.SelectOption(label="🧹 Vider la file", value="clear", description="Vide la file sans couper le son"),
+                    discord.SelectOption(label="🚪 Quitter le salon", value="leave", description="Le bot se déconnecte du vocal")
+                ]))
+                await interaction.response.edit_message(view=self)
+                return False
 
             # List Management (Select)
             elif cid == "select_item":
@@ -2098,6 +2628,11 @@ class RoutineCreationView(discord.ui.View):
                 val = interaction.data["values"][0]
                 self.triggers.append({"type": "event", "data": {"event": val}})
                 # Remove the select by updating components
+            elif cid == "quick_select_control":
+                self.actions.append({
+                    "type": "player_control",
+                    "command": interaction.data["values"][0]
+                })
             elif cid == "quick_select_sound":
                 val = interaction.data["values"][0]
                 if val != "none":
@@ -2452,7 +2987,8 @@ class RoutineCreationView(discord.ui.View):
                 primary_trigger["type"],
                 primary_trigger["data"],
                 self.actions,
-                final_conditions
+                final_conditions,
+                str(self.guild_id)
             )
             msg = f"La routine **{self.name}** a été mise à jour."
         else:
@@ -2472,25 +3008,164 @@ class RoutineCreationView(discord.ui.View):
         await interaction.response.edit_message(embed=embed, view=None)
 
 class TimeInputModal(discord.ui.Modal, title="Ajouter Timer"):
-    duration = discord.ui.TextInput(label="Durée (ex: 10s, 5m)", placeholder="10s")
+    duration = discord.ui.TextInput(label="Intervalle (ex: 10s, 5m, 1h30m)", placeholder="10s")
     def __init__(self, view):
         super().__init__()
         self.view = view
     async def on_submit(self, interaction: discord.Interaction):
-        val = self.duration.value.strip()
-        seconds = 0
-        if val.endswith("s"): seconds = int(val[:-1])
-        elif val.endswith("m"): seconds = int(val[:-1]) * 60
-        elif val.isdigit(): seconds = int(val)
-        if seconds > 0:
-            self.view.triggers.append({"type": "timer", "data": {"interval_seconds": seconds}})
-            self.view.update_components()
-            await self.view.refresh_embed(interaction)
+        try:
+            seconds = parse_duration_seconds(self.duration.value)
+        except ValueError as e:
+            await interaction.response.send_message(f"❌ {e}", ephemeral=True)
+            return
+        if seconds <= 0:
+            await interaction.response.send_message(
+                "❌ L'intervalle doit être supérieur à 0.", ephemeral=True)
+            return
+        self.view.triggers.append({"type": "timer", "data": {"interval_seconds": seconds}})
+        self.view.update_components()
+        await self.view.refresh_embed(interaction)
+
+
+class ScheduleInputModal(discord.ui.Modal, title="Déclenchement à heure fixe"):
+    heure = discord.ui.TextInput(label="Heure (HH:MM)", placeholder="18:00")
+    jours = discord.ui.TextInput(
+        label="Jours (optionnel)",
+        placeholder="lun,mar,ven — vide = tous les jours",
+        required=False
+    )
+
+    def __init__(self, view):
+        super().__init__()
+        self.view = view
+
+    async def on_submit(self, interaction: discord.Interaction):
+        raw_time = self.heure.value.strip()
+        if not re.fullmatch(r'\d{1,2}:\d{2}', raw_time):
+            await interaction.response.send_message(
+                "❌ Heure invalide. Format attendu : HH:MM (ex: 18:00).", ephemeral=True)
+            return
+
+        hours, minutes = (int(x) for x in raw_time.split(':'))
+        if not (0 <= hours <= 23 and 0 <= minutes <= 59):
+            await interaction.response.send_message("❌ Heure hors plage.", ephemeral=True)
+            return
+
+        days = []
+        for token in (self.jours.value or "").split(','):
+            token = token.strip().lower()
+            if not token:
+                continue
+            if token not in WEEKDAYS:
+                await interaction.response.send_message(
+                    f"❌ Jour inconnu : {token}. Utilisez lun, mar, mer, jeu, ven, sam, dim.",
+                    ephemeral=True)
+                return
+            days.append(WEEKDAYS[token])
+
+        self.view.triggers.append({
+            "type": "schedule",
+            "data": {"time": f"{hours:02d}:{minutes:02d}", "days": sorted(set(days))}
+        })
+        self.view.update_components()
+        await self.view.refresh_embed(interaction)
+
+
+class CountInputModal(discord.ui.Modal, title="Palier de membres"):
+    count = discord.ui.TextInput(label="Nombre de membres", placeholder="3")
+
+    def __init__(self, view):
+        super().__init__()
+        self.view = view
+
+    async def on_submit(self, interaction: discord.Interaction):
+        raw = self.count.value.strip()
+        if not raw.isdigit() or int(raw) < 1:
+            await interaction.response.send_message(
+                "❌ Indiquez un nombre entier supérieur ou égal à 1.", ephemeral=True)
+            return
+
+        self.view.triggers.append({
+            "type": "event",
+            "data": {"event": "voice_count_reached", "count": int(raw)}
+        })
+        self.view.update_components()
+        await self.view.refresh_embed(interaction)
+
+
+class KeywordInputModal(discord.ui.Modal, title="Mot-clé ou réaction"):
+    kind = discord.ui.TextInput(label="Type (message ou reaction)", placeholder="message")
+    value = discord.ui.TextInput(label="Mot-clé ou émoji", placeholder="bonjour")
+
+    def __init__(self, view):
+        super().__init__()
+        self.view = view
+
+    async def on_submit(self, interaction: discord.Interaction):
+        kind = self.kind.value.strip().lower()
+        value = self.value.value.strip()
+
+        if not value:
+            await interaction.response.send_message("❌ Valeur manquante.", ephemeral=True)
+            return
+
+        if kind.startswith("mess"):
+            self.view.triggers.append({
+                "type": "event",
+                "data": {"event": "message", "keyword": value}
+            })
+            if not Config.MESSAGE_CONTENT_INTENT:
+                await interaction.response.send_message(
+                    "⚠️ Trigger ajouté, mais l'intent « Message Content » est désactivé : "
+                    "il ne se déclenchera pas tant que MESSAGE_CONTENT_INTENT=true n'est pas "
+                    "défini et l'intent coché dans le portail Discord.",
+                    ephemeral=True
+                )
+                self.view.update_components()
+                return
+        elif kind.startswith("react"):
+            self.view.triggers.append({
+                "type": "event",
+                "data": {"event": "reaction", "emoji": value}
+            })
+        else:
+            await interaction.response.send_message(
+                "❌ Type invalide. Utilisez « message » ou « reaction ».", ephemeral=True)
+            return
+
+        self.view.update_components()
+        await self.view.refresh_embed(interaction)
 
 class ConditionInputModal(discord.ui.Modal, title="Ajouter Condition"):
-    c_type = discord.ui.TextInput(label="Type (user, channel, role, time, date)", placeholder="user")
-    value = discord.ui.TextInput(label="Valeur (ID, HH:MM-HH:MM, JJ:MM-JJ:MM)", placeholder="123456789")
-    op = discord.ui.TextInput(label="Opérateur (==, !=)", placeholder="==", required=False, default="==")
+    c_type = discord.ui.TextInput(
+        label="Type",
+        placeholder="user, channel, role, time, date, count, chance, day, playing"
+    )
+    value = discord.ui.TextInput(
+        label="Valeur",
+        placeholder="123456789 · 18:00-23:00 · 3 · 30 · lun,ven · false"
+    )
+    op = discord.ui.TextInput(
+        label="Opérateur (==, !=, >, <, >=, <=)",
+        placeholder="==",
+        required=False,
+        default="=="
+    )
+
+    VALID_TYPES = {
+        "user": "user_id",
+        "channel": "channel_id",
+        "role": "role_id",
+        "time": "time_range",
+        "date": "date_range",
+        "count": "member_count",
+        "members": "member_count",
+        "chance": "chance",
+        "day": "weekday",
+        "jour": "weekday",
+        "playing": "is_playing",
+    }
+    VALID_OPS = {"==", "!=", ">", "<", ">=", "<="}
 
     def __init__(self, view):
         super().__init__()
@@ -2499,36 +3174,153 @@ class ConditionInputModal(discord.ui.Modal, title="Ajouter Condition"):
     async def on_submit(self, interaction: discord.Interaction):
         t = self.c_type.value.lower().strip()
         v = self.value.value.strip()
-        o = self.op.value.strip()
-        
-        valid_types = {"user": "user_id", "channel": "channel_id", "role": "role_id", "time": "time_range", "date": "date_range"}
-        if t in valid_types:
-            self.view.conditions.append({"type": valid_types[t], "value": v, "op": o})
-            self.view.update_components()
-            await self.view.refresh_embed(interaction)
-        else:
-            await interaction.response.send_message(f"Type invalide. Utilisez: {', '.join(valid_types.keys())}", ephemeral=True)
+        o = (self.op.value or "==").strip() or "=="
+
+        if t not in self.VALID_TYPES:
+            await interaction.response.send_message(
+                f"❌ Type invalide. Utilisez : {', '.join(sorted(set(self.VALID_TYPES)))}",
+                ephemeral=True
+            )
+            return
+
+        if o not in self.VALID_OPS:
+            await interaction.response.send_message(
+                f"❌ Opérateur invalide. Utilisez : {', '.join(sorted(self.VALID_OPS))}",
+                ephemeral=True
+            )
+            return
+
+        self.view.conditions.append({"type": self.VALID_TYPES[t], "value": v, "op": o})
+        self.view.update_components()
+        await self.view.refresh_embed(interaction)
 
 class WaitInputModal(discord.ui.Modal, title="Ajouter Pause"):
-    duration = discord.ui.TextInput(label="Durée (secondes)", placeholder="5")
+    duration = discord.ui.TextInput(
+        label="Durée ou plage",
+        placeholder="5s, 1m20s, ou 1m20s-2h pour un délai aléatoire"
+    )
+
     def __init__(self, view):
         super().__init__()
         self.view = view
+
     async def on_submit(self, interaction: discord.Interaction):
-        if self.duration.value.isdigit():
-            self.view.actions.append({"type": "wait", "delay": int(self.duration.value)})
-            self.view.update_components()
-            await self.view.refresh_embed(interaction)
+        try:
+            low, high = parse_duration_range(self.duration.value)
+        except ValueError as e:
+            await interaction.response.send_message(f"❌ {e}", ephemeral=True)
+            return
+
+        if high > low:
+            self.view.actions.append({"type": "wait", "delay_min": low, "delay_max": high})
+        else:
+            self.view.actions.append({"type": "wait", "delay": low})
+
+        self.view.update_components()
+        await self.view.refresh_embed(interaction)
+
+
+class ChanceInputModal(discord.ui.Modal, title="Probabilité"):
+    percent = discord.ui.TextInput(label="Pourcentage (0-100)", placeholder="30")
+
+    def __init__(self, view):
+        super().__init__()
+        self.view = view
+
+    async def on_submit(self, interaction: discord.Interaction):
+        raw = self.percent.value.strip().rstrip('%')
+        try:
+            value = float(raw)
+        except ValueError:
+            await interaction.response.send_message("❌ Pourcentage invalide.", ephemeral=True)
+            return
+
+        if not 0 <= value <= 100:
+            await interaction.response.send_message(
+                "❌ Le pourcentage doit être compris entre 0 et 100.", ephemeral=True)
+            return
+
+        self.view.actions.append({"type": "chance", "percent": value})
+        self.view.update_components()
+        await self.view.refresh_embed(interaction)
+
+
+class VolumeInputModal(discord.ui.Modal, title="Changer le volume"):
+    value = discord.ui.TextInput(
+        label="Volume 0-200, ou 'reset'",
+        placeholder="150"
+    )
+
+    def __init__(self, view):
+        super().__init__()
+        self.view = view
+
+    async def on_submit(self, interaction: discord.Interaction):
+        raw = self.value.value.strip().lower()
+
+        if raw != "reset":
+            if not raw.isdigit() or not 0 <= int(raw) <= 200:
+                await interaction.response.send_message(
+                    "❌ Indiquez un entier entre 0 et 200, ou « reset ».", ephemeral=True)
+                return
+            raw = int(raw)
+
+        self.view.actions.append({"type": "volume", "value": raw})
+        self.view.update_components()
+        await self.view.refresh_embed(interaction)
+
+
+class MoveInputModal(discord.ui.Modal, title="Déplacer vers un salon"):
+    channel_id = discord.ui.TextInput(label="ID du salon vocal", placeholder="123456789012345678")
+    target = discord.ui.TextInput(
+        label="Qui déplacer ? (bot ou membre)",
+        placeholder="bot",
+        required=False,
+        default="bot"
+    )
+
+    def __init__(self, view):
+        super().__init__()
+        self.view = view
+
+    async def on_submit(self, interaction: discord.Interaction):
+        cid = self.channel_id.value.strip().strip("<>#")
+        if not cid.isdigit():
+            await interaction.response.send_message("❌ ID de salon invalide.", ephemeral=True)
+            return
+
+        raw_target = (self.target.value or "bot").strip().lower()
+        target = "member" if raw_target.startswith(("mem", "mbr", "user")) else "bot"
+
+        self.view.actions.append({"type": "move", "target": target, "channel_id": cid})
+        self.view.update_components()
+        await self.view.refresh_embed(interaction)
 
 class MessageInputModal(discord.ui.Modal, title="Ajouter Message"):
     content = discord.ui.TextInput(label="Message", placeholder="Coucou {user}!")
-    channel_id = discord.ui.TextInput(label="ID Salon (Optionnel)", required=False, placeholder="Laisser vide pour salon courant")
+    channel_id = discord.ui.TextInput(
+        label="ID Salon, ou 'mp'",
+        required=False,
+        placeholder="Vide = salon courant · 'mp' = message privé"
+    )
+
     def __init__(self, view):
         super().__init__()
         self.view = view
+
     async def on_submit(self, interaction: discord.Interaction):
-        cid = self.channel_id.value.strip() if self.channel_id.value else None
-        self.view.actions.append({"type": "message", "content": self.content.value, "channel_id": cid})
+        cid = (self.channel_id.value or "").strip()
+
+        # "mp" transforme l'action en message privé au membre déclencheur
+        if cid.lower() in ("mp", "dm", "privé", "prive"):
+            self.view.actions.append({"type": "dm", "content": self.content.value})
+        else:
+            self.view.actions.append({
+                "type": "message",
+                "content": self.content.value,
+                "channel_id": cid or None
+            })
+
         self.view.update_components()
         await self.view.refresh_embed(interaction)
 
@@ -2581,8 +3373,8 @@ async def routine_cmd(interaction: discord.Interaction, name: str, command: str)
         await bot.routine_manager.load_routines()
         
         # Build confirmation message
-        trigger_desc = f"Timer {trigger_data.get('interval_seconds', trigger_data.get('interval_minutes', 0)*60)}s" if trigger_type == "timer" else f"Event {trigger_data.get('event')}"
-        actions_desc = ", ".join([a.get('sound_name', f"wait {a.get('delay')}s") if a['type'] != 'wait' else f"wait {a.get('delay')}s" for a in actions])
+        trigger_desc = describe_trigger(trigger_type, trigger_data)
+        actions_desc = " → ".join(describe_action(a) for a in actions)
         
         embed = discord.Embed(title="✅ Routine créée", color=discord.Color.green())
         embed.add_field(name="Nom", value=name, inline=True)
@@ -2600,4 +3392,18 @@ async def routine_cmd(interaction: discord.Interaction, name: str, command: str)
 
 
 if __name__ == "__main__":
-    bot.run(Config.DISCORD_TOKEN)
+    try:
+        bot.run(Config.DISCORD_TOKEN)
+    except discord.PrivilegedIntentsRequired:
+        logger.critical(
+            "❌ L'intent privilégié « Server Members » est demandé mais n'est pas "
+            "activé pour ce bot.\n"
+            "   → Activez-le dans le portail développeur Discord "
+            "(Applications > votre bot > Bot > Privileged Gateway Intents),\n"
+            "   → ou lancez le bot avec MEMBERS_INTENT=false pour vous en passer "
+            "(les conditions role= des routines deviennent alors peu fiables)."
+        )
+        sys.exit(1)
+    except discord.LoginFailure:
+        logger.critical("❌ Token Discord refusé. Vérifiez DISCORD_TOKEN.")
+        sys.exit(1)

@@ -11,6 +11,7 @@ Utilise aiosqlite pour des opérations asynchrones.
 Auteur: Soundboard Bot
 """
 
+import asyncio
 import json
 import os
 import logging
@@ -36,7 +37,9 @@ class DatabaseManager:
     """
     
     # Clés de configuration valides pour éviter les injections SQL
-    VALID_CONFIG_KEYS = frozenset({"max_duration", "max_file_size_mb", "max_name_length"})
+    VALID_CONFIG_KEYS = frozenset({
+        "max_duration", "max_file_size_mb", "max_name_length", "volume"
+    })
     
     def __init__(self, db_path: str):
         """
@@ -46,19 +49,57 @@ class DatabaseManager:
             db_path: Chemin absolu vers le fichier de base de données
         """
         self.db_path = db_path
+        self._conn: Optional[aiosqlite.Connection] = None
+        self._lock = asyncio.Lock()
+
+    async def connect(self) -> aiosqlite.Connection:
+        """
+        Ouvre (une seule fois) la connexion partagée à la base.
+        
+        Une connexion persistante en mode WAL évite d'ouvrir un fichier à
+        chaque requête et supprime les "database is locked" quand une
+        routine écrit pendant qu'une commande lit.
+        
+        Returns:
+            La connexion aiosqlite partagée
+        """
+        if self._conn is None:
+            self._conn = await aiosqlite.connect(self.db_path)
+            self._conn.row_factory = aiosqlite.Row
+            await self._conn.execute("PRAGMA journal_mode=WAL")
+            await self._conn.execute("PRAGMA synchronous=NORMAL")
+            await self._conn.execute("PRAGMA busy_timeout=5000")
+            await self._conn.commit()
+            logger.debug("Connexion SQLite ouverte (WAL)")
+        return self._conn
+
+    async def close(self) -> None:
+        """Ferme la connexion partagée (à appeler à l'arrêt du bot)."""
+        if self._conn is not None:
+            try:
+                await self._conn.close()
+            except Exception as e:
+                logger.warning(f"Erreur lors de la fermeture de la base: {e}")
+            finally:
+                self._conn = None
 
     @asynccontextmanager
     async def _get_connection(self):
         """
-        Context manager pour obtenir une connexion à la base de données.
+        Context manager donnant accès à la connexion partagée.
         
-        Assure que la connexion est correctement fermée après utilisation.
+        Le verrou sérialise les accès : sans lui, deux méthodes faisant
+        SELECT puis INSERT pourraient s'entrelacer sur la même connexion et
+        valider les écritures l'une de l'autre.
+        
+        Attention : ne jamais appeler une autre méthode de cette classe
+        depuis l'intérieur de ce bloc (le verrou n'est pas réentrant).
         
         Yields:
             Connexion aiosqlite configurée avec row_factory
         """
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
+        async with self._lock:
+            db = await self.connect()
             yield db
 
     async def init_db(self) -> None:
@@ -72,7 +113,7 @@ class DatabaseManager:
         
         Ajoute également les index pour optimiser les recherches.
         """
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._get_connection() as db:
             # Table des configurations par serveur
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS guild_configs (
@@ -80,6 +121,7 @@ class DatabaseManager:
                     max_duration INTEGER,
                     max_file_size_mb INTEGER,
                     max_name_length INTEGER,
+                    volume INTEGER,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
@@ -157,6 +199,13 @@ class DatabaseManager:
             except Exception:
                 pass
             
+            # Ajouter volume si manquant
+            try:
+                await db.execute("ALTER TABLE guild_configs ADD COLUMN volume INTEGER")
+                logger.info("Migration: colonne volume ajoutée à guild_configs")
+            except Exception:
+                pass
+            
             await db.commit()
             
         # Migration des fichiers sons vers UUID (hors transaction pour accès fichiers)
@@ -177,9 +226,7 @@ class DatabaseManager:
         # Pattern pour détecter un UUID hex (32 caractères hex)
         uuid_pattern = re.compile(r'^[a-f0-9]{32}\.[a-zA-Z0-9]+$')
         
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            
+        async with self._get_connection() as db:
             # Récupérer tous les sons
             cursor = await db.execute("SELECT id, guild_id, filename FROM sounds")
             sounds = await cursor.fetchall()
@@ -273,7 +320,7 @@ class DatabaseManager:
             logger.warning(f"Tentative de définir une clé invalide: {key}")
             return False
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._get_connection() as db:
             # Vérifier si le serveur existe déjà
             async with db.execute(
                 "SELECT 1 FROM guild_configs WHERE guild_id = ?", 
@@ -314,7 +361,7 @@ class DatabaseManager:
         Returns:
             True si l'opération a réussi
         """
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._get_connection() as db:
             try:
                 await db.execute("""
                     INSERT INTO sounds (guild_id, name, filename, added_by, active)
@@ -344,7 +391,7 @@ class DatabaseManager:
         Returns:
             True si le son a été supprimé
         """
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._get_connection() as db:
             cursor = await db.execute(
                 "DELETE FROM sounds WHERE guild_id = ? AND name = ?",
                 (str(guild_id), name.lower())
@@ -425,7 +472,7 @@ class DatabaseManager:
             guild_id: ID du serveur ou "global"
             name: Nom du son
         """
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._get_connection() as db:
             await db.execute(
                 "UPDATE sounds SET play_count = play_count + 1 WHERE guild_id = ? AND name = ?",
                 (str(guild_id), name.lower())
@@ -444,7 +491,7 @@ class DatabaseManager:
         Returns:
             True si le renommage a réussi, False sinon
         """
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._get_connection() as db:
             # Vérifier que le nouveau nom n'existe pas déjà
             cursor = await db.execute(
                 "SELECT 1 FROM sounds WHERE guild_id = ? AND name = ?",
@@ -504,6 +551,13 @@ class DatabaseManager:
                 rows = await cursor.fetchall()
                 existing_filenames = {row[0] for row in rows}
         
+        # Noms déjà pris : chargés UNE fois, puis maintenus en mémoire.
+        # (Auparavant list_sounds() était rappelé pour chaque fichier.)
+        taken_names = set(await self.list_sounds(guild_id))
+        
+        import re
+        uuid_pattern = re.compile(r'^[a-f0-9]{32}\.[a-zA-Z0-9]+$')
+        
         added_count = 0
         for filename in audio_files:
             # Vérifier si le fichier est déjà dans la DB (par filename)
@@ -512,9 +566,6 @@ class DatabaseManager:
             
             # Générer le nom d'affichage à partir du fichier
             # Si c'est un UUID, utiliser un nom par défaut
-            import re
-            uuid_pattern = re.compile(r'^[a-f0-9]{32}\.[a-zA-Z0-9]+$')
-            
             if uuid_pattern.match(filename):
                 # Fichier orphelin avec nom UUID - générer un nom
                 name = f"son_{filename[:8]}"
@@ -522,14 +573,14 @@ class DatabaseManager:
                 name = os.path.splitext(filename)[0].lower().replace(" ", "_")
             
             # Vérifier que le nom n'existe pas déjà, sinon ajouter un suffixe
-            db_sounds = await self.list_sounds(guild_id)
             original_name = name
             counter = 1
-            while name in db_sounds:
+            while name in taken_names:
                 name = f"{original_name}_{counter}"
                 counter += 1
             
             await self.add_sound(guild_id, name, filename, "System Sync")
+            taken_names.add(name)
             added_count += 1
         
         if added_count > 0:
@@ -576,7 +627,7 @@ class DatabaseManager:
         Returns:
             ID de la routine créée
         """
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._get_connection() as db:
             cursor = await db.execute("""
                 INSERT INTO routines (guild_id, name, trigger_type, trigger_data, conditions, actions)
                 VALUES (?, ?, ?, ?, ?, ?)
@@ -621,21 +672,30 @@ class DatabaseManager:
                     routines.append(r)
                 return routines
 
-    async def get_routine_by_id(self, routine_id: int) -> Optional[Dict[str, Any]]:
+    async def get_routine_by_id(
+        self,
+        routine_id: int,
+        guild_id: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
         """
         Récupère une routine par son ID.
         
         Args:
             routine_id: ID de la routine
+            guild_id: Si fourni, la routine n'est retournée que si elle
+                appartient à ce serveur
             
         Returns:
             Dictionnaire de la routine ou None si non trouvée
         """
+        query = "SELECT * FROM routines WHERE id = ?"
+        params: List[Any] = [routine_id]
+        if guild_id is not None:
+            query += " AND guild_id = ?"
+            params.append(str(guild_id))
+        
         async with self._get_connection() as db:
-            async with db.execute(
-                "SELECT * FROM routines WHERE id = ?",
-                (routine_id,)
-            ) as cursor:
+            async with db.execute(query, tuple(params)) as cursor:
                 row = await cursor.fetchone()
                 if row:
                     r = dict(row)
@@ -645,43 +705,53 @@ class DatabaseManager:
                     return r
                 return None
 
-    async def delete_routine(self, routine_id: int) -> bool:
+    async def delete_routine(self, routine_id: int, guild_id: Optional[str] = None) -> bool:
         """
         Supprime une routine.
         
         Args:
             routine_id: ID de la routine à supprimer
+            guild_id: Si fourni, la suppression n'a lieu que si la routine
+                appartient à ce serveur. Les IDs étant auto-incrémentés et
+                globaux, ce filtre empêche un serveur d'agir sur un autre.
             
         Returns:
             True si la routine a été supprimée
         """
-        async with aiosqlite.connect(self.db_path) as db:
-            cursor = await db.execute(
-                "DELETE FROM routines WHERE id = ?",
-                (routine_id,)
-            )
+        query = "DELETE FROM routines WHERE id = ?"
+        params: List[Any] = [routine_id]
+        if guild_id is not None:
+            query += " AND guild_id = ?"
+            params.append(str(guild_id))
+        
+        async with self._get_connection() as db:
+            cursor = await db.execute(query, tuple(params))
             await db.commit()
             deleted = cursor.rowcount > 0
             if deleted:
                 logger.info(f"Routine supprimée: id={routine_id}")
             return deleted
 
-    async def toggle_routine(self, routine_id: int) -> Optional[bool]:
+    async def toggle_routine(self, routine_id: int, guild_id: Optional[str] = None) -> Optional[bool]:
         """
         Active ou désactive une routine.
         
         Args:
             routine_id: ID de la routine
+            guild_id: Si fourni, la routine doit appartenir à ce serveur
             
         Returns:
             Nouvel état (True=actif, False=inactif), ou None si routine non trouvée
         """
-        async with aiosqlite.connect(self.db_path) as db:
+        query = "SELECT active FROM routines WHERE id = ?"
+        params: List[Any] = [routine_id]
+        if guild_id is not None:
+            query += " AND guild_id = ?"
+            params.append(str(guild_id))
+        
+        async with self._get_connection() as db:
             # Récupérer l'état actuel
-            async with db.execute(
-                "SELECT active FROM routines WHERE id = ?",
-                (routine_id,)
-            ) as cursor:
+            async with db.execute(query, tuple(params)) as cursor:
                 row = await cursor.fetchone()
                 if not row:
                     return None
@@ -705,7 +775,8 @@ class DatabaseManager:
         trigger_type: str,
         trigger_data: Dict,
         actions: List[Dict],
-        conditions: Optional[Dict] = None
+        conditions: Optional[Dict] = None,
+        guild_id: Optional[str] = None
     ) -> bool:
         """
         Met à jour une routine existante.
@@ -717,29 +788,151 @@ class DatabaseManager:
             trigger_data: Nouvelles données du déclencheur
             actions: Nouvelle liste d'actions
             conditions: Nouvelles conditions
+            guild_id: Si fourni, la routine doit appartenir à ce serveur
             
         Returns:
             True si la mise à jour a réussi
         """
-        async with aiosqlite.connect(self.db_path) as db:
-            cursor = await db.execute("""
+        query = """
                 UPDATE routines 
                 SET name = ?, trigger_type = ?, trigger_data = ?, 
                     conditions = ?, actions = ?
                 WHERE id = ?
-            """, (
-                name,
-                trigger_type,
-                json.dumps(trigger_data),
-                json.dumps(conditions) if conditions else None,
-                json.dumps(actions),
-                routine_id
-            ))
+            """
+        params: List[Any] = [
+            name,
+            trigger_type,
+            json.dumps(trigger_data),
+            json.dumps(conditions) if conditions else None,
+            json.dumps(actions),
+            routine_id
+        ]
+        if guild_id is not None:
+            query += " AND guild_id = ?"
+            params.append(str(guild_id))
+        
+        async with self._get_connection() as db:
+            cursor = await db.execute(query, tuple(params))
             await db.commit()
             updated = cursor.rowcount > 0
             if updated:
                 logger.info(f"Routine mise à jour: id={routine_id}, name={name}")
             return updated
+
+    # ==================== Statistiques ====================
+
+    async def get_stats(self, guild_id: str, limit: int = 10) -> Dict[str, Any]:
+        """
+        Récupère les statistiques de lecture d'un serveur.
+        
+        Prend en compte les sons du serveur et les sons globaux, dont le
+        compteur play_count est alimenté à chaque lecture.
+        
+        Args:
+            guild_id: ID du serveur
+            limit: Nombre de sons à retourner dans le top
+            
+        Returns:
+            Dictionnaire {total_sounds, total_plays, top: [(nom, compte, portée)]}
+        """
+        async with self._get_connection() as db:
+            async with db.execute(
+                """
+                SELECT name, play_count, guild_id
+                FROM sounds
+                WHERE guild_id IN (?, 'global') AND active = 1
+                ORDER BY play_count DESC, name ASC
+                """,
+                (str(guild_id),)
+            ) as cursor:
+                rows = await cursor.fetchall()
+        
+        return {
+            'total_sounds': len(rows),
+            'total_plays': sum(row['play_count'] or 0 for row in rows),
+            'top': [
+                {
+                    'name': row['name'],
+                    'plays': row['play_count'] or 0,
+                    'global': row['guild_id'] == 'global'
+                }
+                for row in rows[:limit]
+            ]
+        }
+
+    # ==================== Nettoyage ====================
+
+    async def remove_sounds_by_filenames(self, guild_id: str, filenames: List[str]) -> int:
+        """
+        Supprime les entrées dont le fichier n'existe plus sur le disque.
+        
+        Args:
+            guild_id: ID du serveur ou "global"
+            filenames: Liste des filenames à retirer de la base
+            
+        Returns:
+            Nombre d'entrées supprimées
+        """
+        if not filenames:
+            return 0
+        
+        placeholders = ",".join("?" * len(filenames))
+        async with self._get_connection() as db:
+            cursor = await db.execute(
+                f"DELETE FROM sounds WHERE guild_id = ? AND filename IN ({placeholders})",
+                (str(guild_id), *filenames)
+            )
+            await db.commit()
+            removed = cursor.rowcount
+        
+        if removed:
+            logger.info(f"Nettoyage: {removed} entrée(s) sans fichier supprimée(s) (guild={guild_id})")
+        return removed
+
+    async def get_filenames(self, guild_id: str) -> Dict[str, str]:
+        """
+        Récupère la correspondance filename -> nom d'affichage d'un serveur.
+        
+        Args:
+            guild_id: ID du serveur ou "global"
+            
+        Returns:
+            Dictionnaire {filename: name}
+        """
+        async with self._get_connection() as db:
+            async with db.execute(
+                "SELECT filename, name FROM sounds WHERE guild_id = ?",
+                (str(guild_id),)
+            ) as cursor:
+                rows = await cursor.fetchall()
+                return {row['filename']: row['name'] for row in rows}
+
+    async def delete_guild_data(self, guild_id: str) -> Dict[str, int]:
+        """
+        Supprime toutes les données d'un serveur.
+        
+        Appelé quand le bot est retiré d'un serveur, pour ne pas laisser
+        de sons, routines et salons ignorés orphelins en base.
+        
+        Args:
+            guild_id: ID du serveur
+            
+        Returns:
+            Dictionnaire du nombre de lignes supprimées par table
+        """
+        result = {}
+        async with self._get_connection() as db:
+            for table in ("sounds", "routines", "ignored_channels", "guild_configs"):
+                cursor = await db.execute(
+                    f"DELETE FROM {table} WHERE guild_id = ?",
+                    (str(guild_id),)
+                )
+                result[table] = cursor.rowcount
+            await db.commit()
+        
+        logger.info(f"Données supprimées pour guild={guild_id}: {result}")
+        return result
+
     # ==================== Salons Ignorés ====================
 
     async def add_ignored_channel(
@@ -760,7 +953,7 @@ class DatabaseManager:
             True si le salon a été ajouté, False s'il était déjà ignoré
         """
         try:
-            async with aiosqlite.connect(self.db_path) as db:
+            async with self._get_connection() as db:
                 await db.execute(
                     """INSERT INTO ignored_channels (guild_id, channel_id, added_by)
                        VALUES (?, ?, ?)""",
@@ -769,10 +962,9 @@ class DatabaseManager:
                 await db.commit()
                 logger.info(f"Salon ignoré ajouté: {channel_id} (guild={guild_id})")
                 return True
-        except Exception as e:
-            if "UNIQUE constraint" in str(e):
-                return False
-            raise
+        except aiosqlite.IntegrityError:
+            # Le salon est déjà dans la liste (contrainte UNIQUE)
+            return False
 
     async def remove_ignored_channel(self, guild_id: str, channel_id: str) -> bool:
         """
@@ -785,7 +977,7 @@ class DatabaseManager:
         Returns:
             True si le salon a été retiré
         """
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._get_connection() as db:
             cursor = await db.execute(
                 "DELETE FROM ignored_channels WHERE guild_id = ? AND channel_id = ?",
                 (str(guild_id), str(channel_id))

@@ -14,10 +14,6 @@ import shutil
 import uuid
 from typing import Optional
 from mutagen import File as MutagenFile
-from mutagen.mp3 import MP3
-from mutagen.oggvorbis import OggVorbis
-from mutagen.flac import FLAC
-from mutagen.mp4 import MP4
 
 from config import Config
 
@@ -188,7 +184,6 @@ class AudioManager:
         os.makedirs(guild_sounds_dir, exist_ok=True)
 
         # Générer un UUID pour le nom de fichier (seul le nom d'affichage sera modifiable)
-        file_ext = os.path.splitext(filename)[1].lower()
         uuid_filename = f"{uuid.uuid4().hex}{file_ext}"
         
         # Chemins temporaire et final
