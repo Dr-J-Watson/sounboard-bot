@@ -29,7 +29,6 @@ from player import PlayerManager
 from routine_manager import (
     RoutineManager,
     format_duration,
-    parse_duration_seconds,
     parse_duration_range,
     WEEKDAYS,
 )
@@ -371,6 +370,10 @@ def describe_trigger(trigger_type: str, trigger_data: dict) -> str:
         Description courte, préfixée d'un émoji
     """
     if trigger_type == 'timer':
+        low = trigger_data.get('interval_min')
+        high = trigger_data.get('interval_max')
+        if low is not None and high is not None:
+            return f"⏰ Timer aléatoire ({format_duration(low)}-{format_duration(high)})"
         seconds = trigger_data.get('interval_seconds', 0)
         if not seconds:
             seconds = trigger_data.get('interval_minutes', 0) * 60
@@ -445,110 +448,368 @@ async def on_app_command_error(
 # COMMANDES GÉNÉRALES
 # =============================================================================
 
-@bot.tree.command(name="help", description="Affiche la liste des commandes et l'aide pour les routines.")
-async def help_command(interaction: discord.Interaction) -> None:
-    """Affiche l'aide complète du bot."""
+# --- Contenu de l'aide, une section par page ---------------------------------
+
+HELP_SECTIONS = {
+    "accueil": {
+        "label": "Accueil",
+        "emoji": "🏠",
+        "title": "📖 Aide du Soundboard",
+        "description": (
+            "Un soundboard Discord avec file d'attente multi-salons et "
+            "routines automatisées.\n\n"
+            "Choisissez une section dans le menu ci-dessous."
+        ),
+        "fields": [
+            ("🎵 Sons & lecture", "Jouer, mettre en file, ajouter et lister les sons.", True),
+            ("⚙️ Administration", "Limites, volume, salons ignorés, maintenance.", True),
+            ("👑 Propriétaire", "Sons globaux et remise à zéro du bot.", True),
+            ("🤖 Routines", "Créer et gérer les automatisations.", True),
+            ("📝 Syntaxe", "Écrire une routine en une ligne de texte.", True),
+            ("💡 Exemples", "Des routines prêtes à copier.", True),
+        ],
+    },
+    "sons": {
+        "label": "Sons & lecture",
+        "emoji": "🎵",
+        "title": "🎵 Sons et lecture",
+        "description": "Commandes accessibles à tous les membres.",
+        "fields": [
+            (
+                "Jouer",
+                "`/play <nom> [salon]` — joue un son, ou l'ajoute à la file\n"
+                "`/skip` — passe au son suivant\n"
+                "`/stop` — arrête la lecture **et vide toute la file**\n"
+                "`/clear [salon]` — vide la file **sans couper** le son en cours",
+                False
+            ),
+            (
+                "Consulter",
+                "`/queue` — file d'attente, avec le salon cible de chaque son\n"
+                "`/list_sounds` — tous les sons disponibles\n"
+                "`/stats [limite]` — classement des sons les plus joués",
+                False
+            ),
+            (
+                "Ajouter",
+                "`/add_sound <fichier> [nom]` — ajoute un son au serveur\n"
+                "Formats : mp3, wav, ogg, m4a, flac, webm. "
+                "Durée et taille limitées par `/config`.",
+                False
+            ),
+            (
+                "À savoir",
+                "La file est commune au serveur mais chaque son garde son salon. "
+                "Si un salon se vide, seuls les sons qui le visaient sont "
+                "ignorés, les autres continuent.",
+                False
+            ),
+        ],
+    },
+    "admin": {
+        "label": "Administration",
+        "emoji": "⚙️",
+        "title": "⚙️ Administration",
+        "description": "Réservé aux membres ayant la permission Administrateur.",
+        "fields": [
+            (
+                "Configuration",
+                "`/config` — affiche toute la configuration du serveur\n"
+                "`/config <paramètre> <valeur>` — modifie un réglage\n"
+                "Paramètres : durée max, taille max, longueur du nom, "
+                "**volume actuel** et **volume maximum** (0 = illimité)",
+                False
+            ),
+            (
+                "Gestion des sons",
+                "`/delete_sound <nom>` — supprime un son et son fichier\n"
+                "`/rename_sound` — renomme un son via un menu\n"
+                "`/sync` — importe les fichiers présents sur le disque\n"
+                "`/cleanup` — supprime les entrées sans fichier et signale "
+                "les fichiers non référencés",
+                False
+            ),
+            (
+                "Salons ignorés",
+                "`/ignore <salon> <action>` — ignore ou réautorise un salon\n"
+                "`/ignored` — liste les salons ignorés *(accessible à tous)*\n"
+                "Le bot ne joue jamais rien dans un salon ignoré.",
+                False
+            ),
+        ],
+    },
+    "owner": {
+        "label": "Propriétaire",
+        "emoji": "👑",
+        "title": "👑 Commandes du propriétaire",
+        "description": (
+            "Réservé au propriétaire de l'application Discord, "
+            "pas aux administrateurs de serveur."
+        ),
+        "fields": [
+            (
+                "Sons globaux",
+                "`/owner_add <portée> <nom> <fichier>` — ajoute un son global "
+                "(disponible sur tous les serveurs) ou ciblé sur un serveur\n"
+                "`/owner_manage` — panel de gestion de tous les sons",
+                False
+            ),
+            (
+                "Configuration",
+                "`/owner_config <portée> <paramètre> <valeur>` — configure "
+                "n'importe quel serveur sans y être",
+                False
+            ),
+            (
+                "Remise à zéro",
+                "`/owner_reset <portée> [supprimer_fichiers]`\n"
+                "Efface sons, routines, salons ignorés et configurations, "
+                "sur un serveur ou sur tous. Les fichiers audio sont conservés "
+                "sauf demande explicite.\n"
+                "⚠️ Irréversible : une confirmation par mot-clé est demandée.",
+                False
+            ),
+        ],
+    },
+    "routines": {
+        "label": "Routines",
+        "emoji": "🤖",
+        "title": "🤖 Routines (automatisations)",
+        "description": (
+            "Une routine exécute des actions quand un événement se produit. "
+            "Création réservée aux administrateurs."
+        ),
+        "fields": [
+            (
+                "Créer",
+                "`/routine_create` — assistant interactif avec boutons\n"
+                "`/routine_cmd <nom> <commande>` — création en une ligne "
+                "*(voir la section Syntaxe)*",
+                False
+            ),
+            (
+                "Gérer",
+                "`/routine_list` — liste des routines *(accessible à tous)*\n"
+                "`/routine_manage` — panel : modifier, activer, supprimer\n"
+                "`/routine_toggle <id>` — active ou désactive\n"
+                "`/routine_delete <id>` — supprime",
+                False
+            ),
+            (
+                "Dans l'assistant",
+                "Trois sections : **Triggers**, **Conditions**, **Actions**. "
+                "Les boutons du bas permettent de passer de l'une à l'autre "
+                "et de sauvegarder depuis n'importe où.\n"
+                "Une routine a besoin d'au moins un déclencheur et une action.",
+                False
+            ),
+        ],
+    },
+    "syntaxe_triggers": {
+        "label": "Syntaxe : déclencheurs",
+        "emoji": "📝",
+        "title": "📝 Syntaxe — déclencheurs",
+        "description": "**`<déclencheur> [if <conditions>] do <actions>`**",
+        "fields": [
+            (
+                "⏰ Temps",
+                "`timer 30s` · `5m` · `1h30m` — intervalle régulier\n"
+                "`timer 10m-20m` — intervalle tiré au sort à chaque fois\n"
+                "`at 18:00` — tous les jours à cette heure\n"
+                "`at lun,ven 09:30` — seulement certains jours",
+                False
+            ),
+            (
+                "🔊 Vocal",
+                "`on join` · `on leave` · `on move`\n"
+                "`on first_join` — premier arrivé dans un salon vide\n"
+                "`on count>=3` — le salon atteint ce nombre de membres\n"
+                "`on mute` · `on unmute` · `on deafen` · `on undeafen`\n"
+                "`on stream` *(= `stream_start`)* · `on stream_stop`\n"
+                "`on video` *(= `video_start`)* · `on video_stop`",
+                False
+            ),
+            (
+                "💬 Texte",
+                "`on message <mot-clé>` — un message contient ce mot\n"
+                "`on reaction <émoji>` — quelqu'un ajoute cette réaction\n"
+                "*Le mot-clé nécessite l'intent « Message Content ».*",
+                False
+            ),
+        ],
+    },
+    "syntaxe_actions": {
+        "label": "Syntaxe : conditions & actions",
+        "emoji": "🎬",
+        "title": "🎬 Syntaxe — conditions et actions",
+        "description": "Conditions liées par `and`, actions enchaînées par `then`.",
+        "fields": [
+            (
+                "🤔 Conditions *(optionnelles)*",
+                "`user=ID` · `channel=ID` · `role=ID` — listes possibles : `user=1,2`\n"
+                "`time=18:00-23:00` · `date=01/12-25/12` · `day=lun,ven`\n"
+                "`count>=3` — membres dans le salon (`>` `<` `>=` `<=`)\n"
+                "`chance=30` — ne se déclenche que 30% du temps\n"
+                "`playing=false` — seulement si rien n'est en cours",
+                False
+            ),
+            (
+                "🎬 Actions",
+                "`play <son>` — le son est ajouté à la file\n"
+                "`wait 1m20s` · `wait 10s-2m` — pause, fixe ou aléatoire\n"
+                "`chance 25%` — interrompt la routine si le tirage échoue\n"
+                "`volume 150` · `volume reset` — plafonné par `/config`\n"
+                "`msg <texte>` · `dm <texte>` — `{user}` et `{username}` "
+                "sont remplacés",
+                False
+            ),
+            (
+                "🎛️ Contrôle de lecture",
+                "`stop` — coupe le son et vide la file\n"
+                "`skip` · `clear`\n"
+                "`leave` — quitte **après** la fin de la file\n"
+                "`leave_now` — quitte immédiatement\n"
+                "`move <id_salon>` · `move member <id_salon>`",
+                False
+            ),
+        ],
+    },
+    "exemples": {
+        "label": "Exemples",
+        "emoji": "💡",
+        "title": "💡 Exemples de routines",
+        "description": "À utiliser avec `/routine_cmd <nom> <commande>`.",
+        "fields": [
+            (
+                "Simples",
+                "```\n"
+                "at 18:00 do play apero\n"
+                "on first_join do play intro\n"
+                "timer 10m-20m do play ambiance\n"
+                "on count>=4 do play foule\n```",
+                False
+            ),
+            (
+                "Avec conditions",
+                "```\n"
+                "on join if chance=25 do play rare\n"
+                "on join if playing=false do play bienvenue\n"
+                "on join if day=sam,dim and time=20:00-23:59 do play soiree\n"
+                "on join if user=123456789 do play theme_perso\n```",
+                False
+            ),
+            (
+                "Enchaînements",
+                "```\n"
+                "on join do wait 10s-2m then play surprise\n"
+                "on join do volume 150 then play fort then volume reset\n"
+                "at 23:00 do play derniere then leave\n"
+                "on leave do stop then leave_now\n```",
+                False
+            ),
+        ],
+    },
+}
+
+HELP_ORDER = [
+    "accueil", "sons", "admin", "owner",
+    "routines", "syntaxe_triggers", "syntaxe_actions", "exemples",
+]
+
+
+def build_help_embed(key: str) -> discord.Embed:
+    """
+    Construit l'embed d'une section d'aide.
+
+    Args:
+        key: Clé de la section dans HELP_SECTIONS
+
+    Returns:
+        L'embed prêt à être envoyé
+    """
+    section = HELP_SECTIONS.get(key, HELP_SECTIONS["accueil"])
+
     embed = discord.Embed(
-        title="📖 Aide du Soundboard",
-        color=discord.Color.gold(),
-        description="Bienvenue ! Voici toutes les commandes disponibles."
+        title=section["title"],
+        description=section["description"],
+        color=discord.Color.gold()
     )
-    
-    # Commandes Sons
-    embed.add_field(
-        name="🎵 Sons",
-        value=(
-            "`/play <nom>` : Joue un son\n"
-            "`/stop` : Arrête la lecture et vide la file\n"
-            "`/skip` : Passe au son suivant\n"
-            "`/queue` : Affiche la file d'attente\n"
-            "`/clear [salon]` : Vide la file sans couper le son en cours\n"
-            "`/list_sounds` : Liste les sons disponibles\n"
-            "`/stats` : Classement des sons les plus joués\n"
-            "`/add_sound <fichier> [nom]` : Ajoute un son"
-        ),
-        inline=False
+    for name, value, inline in section["fields"]:
+        embed.add_field(name=name, value=value, inline=inline)
+
+    position = HELP_ORDER.index(key) + 1 if key in HELP_ORDER else 1
+    embed.set_footer(text=f"Section {position}/{len(HELP_ORDER)} · menu ci-dessous")
+    return embed
+
+
+class HelpView(discord.ui.View):
+    """Navigation entre les sections de l'aide."""
+
+    def __init__(self, author_id: int, current: str = "accueil"):
+        super().__init__(timeout=300)
+        self.author_id = author_id
+        self.current = current if current in HELP_SECTIONS else "accueil"
+        self._build_select()
+
+    def _build_select(self) -> None:
+        """(Re)construit le menu avec la section courante pré-sélectionnée."""
+        self.clear_items()
+        self.add_item(discord.ui.Select(
+            placeholder="Choisir une section…",
+            custom_id="help_section",
+            options=[
+                discord.SelectOption(
+                    label=HELP_SECTIONS[key]["label"],
+                    value=key,
+                    emoji=HELP_SECTIONS[key]["emoji"],
+                    default=(key == self.current)
+                )
+                for key in HELP_ORDER
+            ]
+        ))
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        """Change de section, en réservant l'aide à son destinataire."""
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message(
+                "Cette aide appartient à quelqu'un d'autre. Tapez `/help`.",
+                ephemeral=True
+            )
+            return False
+
+        if interaction.data.get("custom_id") == "help_section":
+            self.current = interaction.data["values"][0]
+            self._build_select()
+            await interaction.response.edit_message(
+                embed=build_help_embed(self.current),
+                view=self
+            )
+        return True
+
+
+@bot.tree.command(name="help", description="Affiche l'aide du bot, section par section.")
+@app_commands.describe(section="Ouvrir directement une section particulière.")
+@app_commands.choices(section=[
+    app_commands.Choice(name="Sons & lecture", value="sons"),
+    app_commands.Choice(name="Administration", value="admin"),
+    app_commands.Choice(name="Propriétaire", value="owner"),
+    app_commands.Choice(name="Routines", value="routines"),
+    app_commands.Choice(name="Syntaxe : déclencheurs", value="syntaxe_triggers"),
+    app_commands.Choice(name="Syntaxe : conditions & actions", value="syntaxe_actions"),
+    app_commands.Choice(name="Exemples", value="exemples"),
+])
+async def help_command(
+    interaction: discord.Interaction,
+    section: Optional[str] = None
+) -> None:
+    """Affiche l'aide, navigable par sections."""
+    key = section if section in HELP_SECTIONS else "accueil"
+
+    await interaction.response.send_message(
+        embed=build_help_embed(key),
+        view=HelpView(interaction.user.id, key),
+        ephemeral=True
     )
-    
-    # Commandes Admin
-    embed.add_field(
-        name="⚙️ Administration",
-        value=(
-            "`/config` : Affiche la configuration du serveur\n"
-            "`/config <paramètre> <valeur>` : Limites, volume et volume max\n"
-            "`/delete_sound <nom>` : Supprime un son\n"
-            "`/sync` : Synchronise les fichiers du disque\n"
-            "`/cleanup` : Nettoie les fichiers et entrées orphelins\n"
-            "`/owner_reset` : Remise à zéro complète *(propriétaire du bot)*"
-        ),
-        inline=False
-    )
-    
-    # Commandes Routines
-    embed.add_field(
-        name="🤖 Routines (Automatisations)",
-        value=(
-            "`/routine_list` : Voir les routines actives\n"
-            "`/routine_create` : Créer avec l'assistant\n"
-            "`/routine_toggle <id>` : Activer/Désactiver\n"
-            "`/routine_delete <id>` : Supprimer\n"
-            "`/routine_cmd <nom> <commande>` : Créer via commande"
-        ),
-        inline=False
-    )
-    
-    # Syntaxe Routine — déclencheurs
-    embed.add_field(
-        name="📝 Routines : déclencheurs",
-        value=(
-            "**Syntaxe :** `<trigger> [if <conditions>] do <actions>`\n"
-            "• `timer 30s` / `5m` / `1h30m` — à intervalle régulier\n"
-            "• `at 18:00` / `at lun,ven 09:30` — à heure fixe\n"
-            "• `on join` / `leave` / `move` / `first_join`\n"
-            "• `on mute` / `unmute` / `deafen` / `undeafen`\n"
-            "• `on stream` / `stream_stop` / `video` / `video_stop`\n"
-            "• `on count>=3` — le salon atteint 3 membres\n"
-            "• `on message <mot-clé>` • `on reaction <émoji>`"
-        ),
-        inline=False
-    )
-    
-    # Syntaxe Routine — conditions et actions
-    embed.add_field(
-        name="📝 Routines : conditions et actions",
-        value=(
-            "**Conditions** *(optionnel, séparées par `and`)* :\n"
-            "• `user=ID` • `channel=ID` • `role=ID` *(listes: `user=1,2`)*\n"
-            "• `time=18:00-23:00` • `date=01/12-25/12` • `day=lun,ven`\n"
-            "• `count>=3` • `chance=30` • `playing=false`\n\n"
-            "**Actions** *(séparées par `then`)* :\n"
-            "• `play <son>` • `wait 1m20s` • `wait 1m20s-2h` *(aléatoire)*\n"
-            "• `chance 25%` — interrompt la suite si le tirage échoue\n"
-            "• `stop` *(coupe tout)* • `skip` • `clear`\n"
-            "• `leave` *(quitte après la file)* • `leave_now` *(quitte tout de suite)*\n"
-            "• `volume 150` • `volume reset` *(plafonné par `/config`)*\n"
-            "• `move <id_salon>` • `move member <id_salon>`\n"
-            "• `msg <texte>` • `dm <texte>`"
-        ),
-        inline=False
-    )
-    
-    embed.add_field(
-        name="💡 Exemples",
-        value=(
-            "`at 18:00 do play apero`\n"
-            "`on first_join do play intro`\n"
-            "`on count>=4 do play foule`\n"
-            "`on join if chance=25 and playing=false do play rare`\n"
-            "`on join do wait 10s-2m then play surprise`\n"
-            "`on leave do stop then leave_now`"
-        ),
-        inline=False
-    )
-    
-    embed.set_footer(text="💡 Utilisez /routine_create pour un assistant interactif !")
-    
-    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 @bot.tree.command(name="list_sounds", description="Liste tous les sons disponibles.")
@@ -3350,21 +3611,34 @@ class RoutineCreationView(discord.ui.View):
         await interaction.response.edit_message(embed=embed, view=None)
 
 class TimeInputModal(discord.ui.Modal, title="Ajouter Timer"):
-    duration = discord.ui.TextInput(label="Intervalle (ex: 10s, 5m, 1h30m)", placeholder="10s")
+    duration = discord.ui.TextInput(
+        label="Intervalle, ou plage aléatoire",
+        placeholder="5m · 1h30m · 10m-20m pour un intervalle au hasard"
+    )
+
     def __init__(self, view):
         super().__init__()
         self.view = view
+
     async def on_submit(self, interaction: discord.Interaction):
         try:
-            seconds = parse_duration_seconds(self.duration.value)
+            low, high = parse_duration_range(self.duration.value)
         except ValueError as e:
             await interaction.response.send_message(f"❌ {e}", ephemeral=True)
             return
-        if seconds <= 0:
+
+        if low <= 0:
             await interaction.response.send_message(
                 "❌ L'intervalle doit être supérieur à 0.", ephemeral=True)
             return
-        self.view.triggers.append({"type": "timer", "data": {"interval_seconds": seconds}})
+
+        # Une plage fait tirer un nouvel intervalle après chaque déclenchement
+        data = (
+            {"interval_min": low, "interval_max": high}
+            if high > low else
+            {"interval_seconds": low}
+        )
+        self.view.triggers.append({"type": "timer", "data": data})
         self.view.update_components()
         await self.view.refresh_embed(interaction)
 

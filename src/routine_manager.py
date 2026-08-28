@@ -329,11 +329,7 @@ class RoutineManager:
         last_run = routine.get('_last_run', 0)
         trigger_data = routine['trigger_data']
         
-        # Calculer l'intervalle en secondes
-        interval = trigger_data.get('interval_seconds', 0)
-        if interval == 0:
-            interval = trigger_data.get('interval_minutes', 0) * 60
-        
+        interval = self._resolve_interval(routine)
         if interval <= 0:
             return
         
@@ -353,8 +349,53 @@ class RoutineManager:
             # laisserait la boucle redéclencher la routine à la seconde
             # suivante.
             routine['_last_run'] = current_time
+            
+            # Intervalle aléatoire : on retire au sort pour le prochain tour
+            if trigger_data.get('interval_max') is not None:
+                routine.pop('_next_interval', None)
+                next_interval = self._resolve_interval(routine)
+                logger.debug(
+                    f"Timer routine '{routine['name']}' exécutée, "
+                    f"prochain déclenchement dans {format_duration(next_interval)}"
+                )
+            else:
+                logger.debug(f"Timer routine '{routine['name']}' exécutée")
+            
             self._spawn_actions(routine, context)
-            logger.debug(f"Timer routine '{routine['name']}' exécutée")
+
+    @staticmethod
+    def _resolve_interval(routine: Dict) -> int:
+        """
+        Détermine l'intervalle courant d'une routine timer, en secondes.
+
+        Un intervalle fixe est renvoyé tel quel. Un intervalle aléatoire
+        ("timer 10m-20m") est tiré une fois puis mémorisé sur la routine,
+        pour que la boucle ne retire pas au sort à chaque seconde ; il est
+        renouvelé après chaque déclenchement.
+
+        Args:
+            routine: Données de la routine
+
+        Returns:
+            L'intervalle à respecter, en secondes
+        """
+        trigger_data = routine['trigger_data']
+
+        low = trigger_data.get('interval_min')
+        high = trigger_data.get('interval_max')
+
+        if low is not None and high is not None:
+            cached = routine.get('_next_interval')
+            if cached is None:
+                low, high = int(low), int(high)
+                cached = random.randint(low, high) if high > low else low
+                routine['_next_interval'] = cached
+            return cached
+
+        interval = trigger_data.get('interval_seconds', 0)
+        if not interval:
+            interval = trigger_data.get('interval_minutes', 0) * 60
+        return int(interval)
 
     async def _process_schedule_routine(self, routine: Dict, current_time: float) -> None:
         """
@@ -1713,12 +1754,18 @@ class RoutineManager:
             duration_str: Durée au format Xs, Xm, ou Xh
             
         Returns:
-            Dictionnaire avec interval_seconds ou interval_minutes
+            Dictionnaire avec interval_seconds, ou interval_min/interval_max
+            pour une plage aléatoire ("10m-20m")
         """
-        seconds = parse_duration_seconds(duration_str)
-        if seconds <= 0:
+        low, high = parse_duration_range(duration_str)
+        
+        if low <= 0:
             raise ValueError("L'intervalle d'un timer doit être supérieur à 0.")
-        return {'interval_seconds': seconds}
+        
+        # Plage: l'intervalle est retiré au sort avant chaque déclenchement
+        if high > low:
+            return {'interval_min': low, 'interval_max': high}
+        return {'interval_seconds': low}
 
     def _parse_conditions(self, condition_str: str) -> Optional[Dict]:
         """
