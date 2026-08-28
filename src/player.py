@@ -70,8 +70,8 @@ class GuildPlayer:
         'options': '-vn'                      # Pas de vidéo, audio uniquement
     }
 
-    # Volume de repli si la base est injoignable (0.0 - 2.0)
-    FALLBACK_VOLUME = 0.7
+    # Volume de repli si la base est injoignable, en pourcentage
+    FALLBACK_VOLUME_PERCENT = 70
 
     # Nombre de tentatives de connexion vocale (la 2e couvre le cas où
     # discord.py n'a pas encore fini de nettoyer une session précédente)
@@ -91,7 +91,8 @@ class GuildPlayer:
         self.guild_id = guild_id
         self.bot = bot
         self.db = db
-        self._volume: Optional[float] = None  # Cache du volume, en 0.0-2.0
+        self._volume: Optional[float] = None      # Cache du volume, en facteur (1.0 = 100%)
+        self._max_volume: Optional[int] = None    # Cache du plafond, en pourcentage
         self.queue: deque[QueueItem] = deque()
         self.voice_client: Optional[discord.VoiceClient] = None
         self.current_sound: Optional[Tuple[str, str]] = None  # (sound_name, requester)
@@ -195,15 +196,55 @@ class GuildPlayer:
         self.voice_client = None
         self._cancel_disconnect_timer()
 
-    async def leave(self) -> None:
+    async def leave(
+        self,
+        wait_for_queue: bool = False,
+        clear_queue: bool = False,
+        timeout: float = 300.0
+    ) -> bool:
         """
-        Quitte le salon vocal en conservant la file d'attente.
+        Quitte le salon vocal.
 
-        Les sons destinés à d'autres salons restent jouables ; ceux dont le
-        salon est devenu invalide seront écartés par process_next().
+        Args:
+            wait_for_queue: Si True, attend la fin de ce qui est en file avant
+                de se déconnecter. Indispensable depuis une routine : l'action
+                `play` ne fait qu'empiler le son, la lecture démarre juste
+                après, si bien qu'un `leave` immédiat ne trouve rien à
+                déconnecter et le bot se reconnecte dans la foulée.
+            clear_queue: Si True, vide la file avant de partir. Sans cela, un
+                départ immédiat serait aussitôt annulé par le son suivant.
+                À laisser à False quand la file peut contenir des sons
+                destinés à d'autres salons (cas du salon qui se vide).
+            timeout: Durée maximale d'attente, en secondes
+
+        Returns:
+            True si le bot était effectivement connecté et a été déconnecté
         """
+        if wait_for_queue:
+            deadline = asyncio.get_running_loop().time() + timeout
+            while asyncio.get_running_loop().time() < deadline:
+                vc = self.voice_client
+                playing = vc is not None and vc.is_connected() and vc.is_playing()
+                if not self.queue and not self.current_sound and not playing:
+                    break
+                await asyncio.sleep(0.25)
+            else:
+                logger.warning(
+                    f"Attente de fin de file dépassée ({timeout}s), déconnexion forcée"
+                )
+        elif clear_queue:
+            # Départ immédiat volontaire : la file ne doit pas relancer une
+            # connexion dans la seconde qui suit.
+            self.queue.clear()
+
+        was_connected = bool(self.voice_client and self.voice_client.is_connected())
+        if not was_connected:
+            # Vérifier l'état réel: la connexion peut être en cours d'établissement
+            was_connected = self._sync_voice_client() is not None
+
         self.current_sound = None
         await self.disconnect()
+        return was_connected
 
     # ------------------------------------------------------------------
     # Déconnexion automatique
@@ -343,42 +384,73 @@ class GuildPlayer:
     # Volume
     # ------------------------------------------------------------------
 
-    async def get_volume(self) -> float:
+    async def get_max_volume(self) -> int:
         """
-        Récupère le volume du serveur (0.0 - 2.0), avec mise en cache.
+        Récupère le plafond de volume du serveur, en pourcentage.
+
+        Configurable par serveur via /config, lui-même borné par
+        Config.VOLUME_HARD_LIMIT.
 
         Returns:
-            Le facteur de volume à appliquer à la lecture
+            Le plafond en pourcentage
+        """
+        if self._max_volume is not None:
+            return self._max_volume
+
+        percent = Config.DEFAULT_MAX_VOLUME
+        if self.db is not None:
+            try:
+                stored = await self.db.get_config(str(self.guild_id), "max_volume", None)
+                if stored is not None:
+                    percent = int(stored)
+            except Exception as e:
+                logger.warning(f"Plafond de volume illisible en base: {e}")
+
+        self._max_volume = max(0, min(Config.VOLUME_HARD_LIMIT, int(percent)))
+        return self._max_volume
+
+    async def get_volume(self) -> float:
+        """
+        Récupère le volume du serveur sous forme de facteur, avec cache.
+
+        La valeur est toujours bornée par le plafond du serveur.
+
+        Returns:
+            Le facteur de volume à appliquer à la lecture (1.0 = 100%)
         """
         if self._volume is not None:
             return self._volume
 
-        percent = self.FALLBACK_VOLUME * 100
+        percent = self.FALLBACK_VOLUME_PERCENT
         if self.db is not None:
             try:
-                percent = await self.db.get_config(
-                    str(self.guild_id), "volume", None
-                )
-                if percent is None:
-                    percent = getattr(Config, "DEFAULT_VOLUME", 70)
+                stored = await self.db.get_config(str(self.guild_id), "volume", None)
+                percent = Config.DEFAULT_VOLUME if stored is None else int(stored)
             except Exception as e:
                 logger.warning(f"Volume illisible en base, valeur de repli utilisée: {e}")
-                percent = self.FALLBACK_VOLUME * 100
 
-        self._volume = max(0.0, min(2.0, float(percent) / 100))
+        ceiling = await self.get_max_volume()
+        self._volume = max(0.0, min(float(ceiling), float(percent))) / 100
         return self._volume
 
-    def set_volume(self, percent: int) -> float:
+    def set_volume(self, percent: int, max_percent: Optional[int] = None) -> float:
         """
         Applique un nouveau volume, y compris au son en cours de lecture.
 
         Args:
-            percent: Volume en pourcentage (0-200)
+            percent: Volume demandé, en pourcentage
+            max_percent: Plafond à appliquer. Par défaut, le dernier plafond
+                connu du serveur, sinon celui de la configuration globale.
 
         Returns:
-            Le facteur de volume appliqué
+            Le facteur de volume réellement appliqué
         """
-        self._volume = max(0.0, min(2.0, float(percent) / 100))
+        ceiling = max_percent if max_percent is not None else self._max_volume
+        if ceiling is None:
+            ceiling = Config.DEFAULT_MAX_VOLUME
+        ceiling = max(0, min(Config.VOLUME_HARD_LIMIT, int(ceiling)))
+
+        self._volume = max(0.0, min(float(ceiling), float(percent))) / 100
 
         # Le PCMVolumeTransformer du son en cours est modifiable à chaud
         vc = self.voice_client
@@ -389,6 +461,12 @@ class GuildPlayer:
                 pass
 
         return self._volume
+
+    def invalidate_volume_cache(self) -> None:
+        """Oublie volume et plafond en cache : ils seront relus en base."""
+        self._volume = None
+        self._max_volume = None
+
 
     # ------------------------------------------------------------------
     # Lecture

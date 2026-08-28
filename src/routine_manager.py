@@ -20,7 +20,7 @@ import time
 import datetime
 import os
 from typing import List, Dict, Any, Optional, Tuple
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from config import Config
 
@@ -197,20 +197,6 @@ class RoutineManager:
         "first": "voice_first_join",
     }
     
-    # Mapping des événements vocaux
-    EVENT_MAPPING = {
-        "voice_join": "join",
-        "voice_leave": "leave", 
-        "voice_move": "move",
-        "voice_mute": "mute",
-        "voice_unmute": "unmute",
-        "voice_deafen": "deafen",
-        "voice_undeafen": "undeafen",
-        "voice_stream_start": "stream_start",
-        "voice_stream_stop": "stream_stop",
-        "voice_video_start": "video_start",
-        "voice_video_stop": "video_stop"
-    }
     
     def __init__(self, bot, db):
         """
@@ -559,13 +545,14 @@ class RoutineManager:
                     if expected is None or human_count != int(expected):
                         continue
                 
-                logger.debug(f"  -> Vérification des conditions...")
+                logger.debug("  -> Vérification des conditions...")
                 if await self._check_conditions(routine, context):
                     logger.info(f"🎯 Routine '{routine['name']}' déclenchée par {event_type}")
                     triggered_routines.add(routine_key)
                     self._spawn_actions(routine, context)
                 else:
-                    logger.debug(f"  -> Conditions non satisfaites")
+                    logger.debug("  -> Conditions non satisfaites")
+
     async def on_message(self, message: discord.Message) -> None:
         """
         Déclenche les routines liées à un mot-clé dans un message.
@@ -1187,6 +1174,12 @@ class RoutineManager:
         if command == 'stop':
             player.stop()
             logger.info("⏹️ Routine: lecture arrêtée et file vidée")
+        elif command == 'leave_now':
+            left = await player.leave(wait_for_queue=False, clear_queue=True)
+            logger.info(
+                "🚪 Routine: déconnexion immédiate"
+                if left else "🚪 Routine: le bot n'était pas connecté"
+            )
         elif command == 'skip':
             skipped = player.skip()
             logger.info(f"⏭️ Routine: skip {'effectué' if skipped else 'sans effet'}")
@@ -1194,8 +1187,15 @@ class RoutineManager:
             removed = player.clear_queue()
             logger.info(f"🧹 Routine: {removed} son(s) retiré(s) de la file")
         elif command == 'leave':
-            await player.leave()
-            logger.info("🚪 Routine: le bot a quitté le salon vocal")
+            # Une action `play` placée avant n'a fait qu'empiler le son : on
+            # attend la fin de la file, sinon le bot se reconnecterait juste
+            # après être parti. Pour un départ immédiat, utiliser `stop`.
+            wait = bool(action.get('wait_for_queue', True))
+            left = await player.leave(wait_for_queue=wait, clear_queue=not wait)
+            if left:
+                logger.info("🚪 Routine: le bot a quitté le salon vocal")
+            else:
+                logger.info("🚪 Routine: le bot n'était pas connecté, rien à quitter")
         else:
             logger.warning(f"Commande de contrôle inconnue: {command}")
 
@@ -1219,7 +1219,7 @@ class RoutineManager:
         raw = action.get('value')
 
         if str(raw).strip().lower() == 'reset':
-            player._volume = None  # forcera une relecture en base
+            player.invalidate_volume_cache()  # forcera une relecture en base
             restored = await player.get_volume()
             logger.info(f"🔊 Routine: volume restauré à {round(restored * 100)}%")
             return
@@ -1230,8 +1230,17 @@ class RoutineManager:
             logger.warning(f"Valeur de volume invalide dans une routine: {raw}")
             return
 
-        applied = player.set_volume(percent)
-        logger.info(f"🔊 Routine: volume réglé sur {round(applied * 100)}%")
+        # Le plafond du serveur s'applique aussi aux routines
+        ceiling = await player.get_max_volume()
+        applied = player.set_volume(percent, ceiling)
+
+        if percent > ceiling:
+            logger.info(
+                f"🔊 Routine: volume {percent}% ramené au plafond du serveur "
+                f"({ceiling}%)"
+            )
+        else:
+            logger.info(f"🔊 Routine: volume réglé sur {round(applied * 100)}%")
 
     async def _action_move(self, action: Dict, context: Optional[Dict]) -> None:
         """
@@ -1818,7 +1827,7 @@ class RoutineManager:
                 if not args:
                     raise ValueError("Contenu manquant après 'dm'")
                 actions.append({"type": "dm", "content": args})
-            elif verb in ("stop", "skip", "clear", "leave", "quit"):
+            elif verb in ("stop", "skip", "clear", "leave", "quit", "leave_now"):
                 command = "leave" if verb == "quit" else verb
                 actions.append({"type": "player_control", "command": command})
             elif verb == "chance":
@@ -1836,8 +1845,12 @@ class RoutineManager:
                     raise ValueError("Valeur manquante après 'volume' (ex: volume 150)")
                 value = args.strip().lower()
                 if value != "reset":
-                    if not value.isdigit() or not 0 <= int(value) <= 200:
-                        raise ValueError("Le volume doit être un entier entre 0 et 200, ou 'reset'.")
+                    limit = Config.VOLUME_HARD_LIMIT
+                    if not value.isdigit() or not 0 <= int(value) <= limit:
+                        raise ValueError(
+                            f"Le volume doit être un entier entre 0 et {limit}, ou 'reset'. "
+                            "Le plafond du serveur (/config max_volume) s'applique en plus."
+                        )
                     value = int(value)
                 actions.append({"type": "volume", "value": value})
             elif verb == "move":

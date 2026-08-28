@@ -51,7 +51,9 @@ class Config:
     
     # === Configuration Bot ===
     VOICE_TIMEOUT_SECONDS: int = int(os.getenv("VOICE_TIMEOUT_SECONDS", "300"))  # 5 minutes par défaut
-    DEFAULT_VOLUME: int = int(os.getenv("DEFAULT_VOLUME", "70"))  # en % (0-200)
+    DEFAULT_VOLUME: int = int(os.getenv("DEFAULT_VOLUME", "70"))       # volume de départ, en %
+    DEFAULT_MAX_VOLUME: int = int(os.getenv("MAX_VOLUME", "200"))      # plafond par défaut, en %
+    VOLUME_HARD_LIMIT: int = int(os.getenv("VOLUME_HARD_LIMIT", "500"))  # plafond absolu, non dépassable
     
     # Intent privilégié "Server Members".
     # Nécessaire pour que les conditions role= et guild.get_member() soient
@@ -91,8 +93,20 @@ class Config:
         if Config.MAX_FILE_SIZE_MB < 0:
             raise ValueError("MAX_FILE_SIZE_MB doit être positif ou nul.")
         
-        if not 0 <= Config.DEFAULT_VOLUME <= 200:
-            raise ValueError("DEFAULT_VOLUME doit être compris entre 0 et 200.")
+        if Config.VOLUME_HARD_LIMIT < 1:
+            raise ValueError("VOLUME_HARD_LIMIT doit être au moins égal à 1.")
+        
+        if not 0 <= Config.DEFAULT_MAX_VOLUME <= Config.VOLUME_HARD_LIMIT:
+            raise ValueError(
+                f"MAX_VOLUME doit être compris entre 0 et {Config.VOLUME_HARD_LIMIT} "
+                "(VOLUME_HARD_LIMIT)."
+            )
+        
+        if not 0 <= Config.DEFAULT_VOLUME <= Config.DEFAULT_MAX_VOLUME:
+            raise ValueError(
+                f"DEFAULT_VOLUME doit être compris entre 0 et {Config.DEFAULT_MAX_VOLUME} "
+                "(MAX_VOLUME)."
+            )
         
         # Créer les dossiers s'ils n'existent pas
         os.makedirs(Config.SOUNDS_DIR, exist_ok=True)

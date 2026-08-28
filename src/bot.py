@@ -348,8 +348,13 @@ def describe_action(action: dict) -> str:
     if a_type == 'move':
         return "↔️ déplacer " + ("le membre" if action.get('target') == 'member' else "le bot")
     if a_type == 'player_control':
-        labels = {'stop': '⏹️ stop', 'skip': '⏭️ skip',
-                  'clear': '🧹 vider la file', 'leave': '🚪 quitter le salon'}
+        labels = {
+            'stop': '⏹️ stop',
+            'skip': '⏭️ skip',
+            'clear': '🧹 vider la file',
+            'leave': '🚪 quitter après la file',
+            'leave_now': '🏃 quitter immédiatement',
+        }
         return labels.get(action.get('command'), 'contrôle')
     return str(a_type)
 
@@ -469,11 +474,12 @@ async def help_command(interaction: discord.Interaction) -> None:
     embed.add_field(
         name="⚙️ Administration",
         value=(
-            "`/config <setting> <value>` : Configure les limites\n"
-            "`/volume [0-200]` : Règle le volume de lecture\n"
+            "`/config` : Affiche la configuration du serveur\n"
+            "`/config <paramètre> <valeur>` : Limites, volume et volume max\n"
             "`/delete_sound <nom>` : Supprime un son\n"
             "`/sync` : Synchronise les fichiers du disque\n"
-            "`/cleanup` : Nettoie les fichiers et entrées orphelins"
+            "`/cleanup` : Nettoie les fichiers et entrées orphelins\n"
+            "`/owner_reset` : Remise à zéro complète *(propriétaire du bot)*"
         ),
         inline=False
     )
@@ -518,8 +524,9 @@ async def help_command(interaction: discord.Interaction) -> None:
             "**Actions** *(séparées par `then`)* :\n"
             "• `play <son>` • `wait 1m20s` • `wait 1m20s-2h` *(aléatoire)*\n"
             "• `chance 25%` — interrompt la suite si le tirage échoue\n"
-            "• `stop` • `skip` • `clear` • `leave` *(quitte le vocal)*\n"
-            "• `volume 150` • `volume reset`\n"
+            "• `stop` *(coupe tout)* • `skip` • `clear`\n"
+            "• `leave` *(quitte après la file)* • `leave_now` *(quitte tout de suite)*\n"
+            "• `volume 150` • `volume reset` *(plafonné par `/config`)*\n"
             "• `move <id_salon>` • `move member <id_salon>`\n"
             "• `msg <texte>` • `dm <texte>`"
         ),
@@ -534,7 +541,7 @@ async def help_command(interaction: discord.Interaction) -> None:
             "`on count>=4 do play foule`\n"
             "`on join if chance=25 and playing=false do play rare`\n"
             "`on join do wait 10s-2m then play surprise`\n"
-            "`on leave do stop then leave`"
+            "`on leave do stop then leave_now`"
         ),
         inline=False
     )
@@ -981,22 +988,66 @@ async def rename_sound(interaction: discord.Interaction) -> None:
 @bot.tree.command(name="config", description="Configure les paramètres du bot (Admin uniquement).")
 @app_commands.describe(
     setting="Le paramètre à modifier",
-    value="La nouvelle valeur (0 = illimité)"
+    value="La nouvelle valeur (0 = illimité). Laisser vide pour consulter."
 )
 @app_commands.choices(setting=[
     app_commands.Choice(name="Durée max (secondes)", value="max_duration"),
     app_commands.Choice(name="Taille max (Mo)", value="max_file_size_mb"),
-    app_commands.Choice(name="Longueur nom max", value="max_name_length")
+    app_commands.Choice(name="Longueur nom max", value="max_name_length"),
+    app_commands.Choice(name="Volume actuel (%)", value="volume"),
+    app_commands.Choice(name="Volume maximum (%)", value="max_volume"),
 ])
 async def config(
     interaction: discord.Interaction,
-    setting: str,
-    value: int
+    setting: Optional[str] = None,
+    value: Optional[int] = None
 ) -> None:
-    """Configure les paramètres du bot pour le serveur."""
+    """Consulte ou modifie la configuration du serveur."""
     if not interaction.guild_id:
         await interaction.response.send_message(
             "❌ Commande serveur uniquement.",
+            ephemeral=True
+        )
+        return
+
+    guild_id = str(interaction.guild_id)
+    player = bot.player_manager.get_player(interaction.guild_id)
+
+    # --- Consultation (aucun paramètre, ou paramètre sans valeur) ---------
+    if value is None:
+        current_volume = round(await player.get_volume() * 100)
+        max_volume = await player.get_max_volume()
+
+        embed = discord.Embed(
+            title="⚙️ Configuration du serveur",
+            color=discord.Color.blurple()
+        )
+        embed.add_field(
+            name="Sons",
+            value=(
+                f"• Durée max : `{await db.get_config(guild_id, 'max_duration', Config.MAX_DURATION_SECONDS)}s`\n"
+                f"• Taille max : `{await db.get_config(guild_id, 'max_file_size_mb', Config.MAX_FILE_SIZE_MB)} Mo`\n"
+                f"• Longueur du nom : `{await db.get_config(guild_id, 'max_name_length', Config.MAX_NAME_LENGTH)}`"
+            ),
+            inline=False
+        )
+        embed.add_field(
+            name="Volume",
+            value=(
+                f"• Volume actuel : `{current_volume}%`\n"
+                f"• Volume maximum : `{max_volume}%` "
+                f"*(plafond absolu : {Config.VOLUME_HARD_LIMIT}%)*"
+            ),
+            inline=False
+        )
+        embed.set_footer(text="0 = illimité · /config <paramètre> <valeur> pour modifier")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+
+    # --- Modification ------------------------------------------------------
+    if setting is None:
+        await interaction.response.send_message(
+            "❌ Indiquez le paramètre à modifier.",
             ephemeral=True
         )
         return
@@ -1015,16 +1066,66 @@ async def config(
         )
         return
 
-    await db.set_config(str(interaction.guild_id), setting, value)
-    
-    # Message de confirmation
+    # Contrôles propres aux réglages de volume
+    if setting == "max_volume":
+        if value > Config.VOLUME_HARD_LIMIT:
+            await interaction.response.send_message(
+                f"🚫 Le volume maximum ne peut pas dépasser {Config.VOLUME_HARD_LIMIT}%. "
+                "Ce plafond absolu se règle avec la variable d'environnement "
+                "`VOLUME_HARD_LIMIT`.",
+                ephemeral=True
+            )
+            return
+
+        await db.set_config(guild_id, "max_volume", value)
+
+        # Ramener le volume courant sous le nouveau plafond si besoin
+        current = await db.get_config(guild_id, "volume", Config.DEFAULT_VOLUME)
+        note = ""
+        if current > value:
+            await db.set_config(guild_id, "volume", value)
+            note = f"\nℹ️ Le volume actuel ({current}%) a été ramené à {value}%."
+
+        player.invalidate_volume_cache()
+        player.set_volume(min(current, value), value)
+
+        await interaction.response.send_message(
+            f"✅ Volume maximum : `{value}%`{note}",
+            ephemeral=True
+        )
+        return
+
+    if setting == "volume":
+        ceiling = await player.get_max_volume()
+        if value > ceiling:
+            await interaction.response.send_message(
+                f"🚫 Le volume ne peut pas dépasser le maximum du serveur "
+                f"(`{ceiling}%`). Modifiez-le avec "
+                f"`/config setting:Volume maximum (%) value:...`.",
+                ephemeral=True
+            )
+            return
+
+        await db.set_config(guild_id, "volume", value)
+        applied = player.set_volume(value, ceiling)
+
+        warning = "\n⚠️ Au-dessus de 100%, le son peut saturer." if value > 100 else ""
+        await interaction.response.send_message(
+            f"✅ Volume : `{round(applied * 100)}%`{warning}",
+            ephemeral=True
+        )
+        return
+
+    # Autres réglages
+    await db.set_config(guild_id, setting, value)
+
     setting_names = {
         "max_duration": "Durée maximale",
         "max_file_size_mb": "Taille maximale",
         "max_name_length": "Longueur max du nom"
     }
     setting_display = setting_names.get(setting, setting)
-    
+
     if value == 0:
         await interaction.response.send_message(
             f"✅ Configuration mise à jour : `{setting_display}` = `Illimité`",
@@ -1115,53 +1216,6 @@ async def stats(interaction: discord.Interaction, limite: Optional[int] = 10) ->
 
     embed.set_footer(text="🌍 = son global, partagé entre les serveurs")
     await interaction.followup.send(embed=embed, ephemeral=True)
-
-
-@bot.tree.command(name="volume", description="Affiche ou modifie le volume de lecture du bot.")
-@app_commands.describe(pourcentage="Nouveau volume entre 0 et 200 (Admin). Laisser vide pour consulter.")
-async def volume(interaction: discord.Interaction, pourcentage: Optional[int] = None) -> None:
-    """Consulte ou règle le volume de lecture du serveur."""
-    if not interaction.guild_id:
-        await interaction.response.send_message(
-            "❌ Commande serveur uniquement.",
-            ephemeral=True
-        )
-        return
-
-    player = bot.player_manager.get_player(interaction.guild_id)
-
-    # Simple consultation
-    if pourcentage is None:
-        current = await player.get_volume()
-        await interaction.response.send_message(
-            f"🔊 Volume actuel : **{round(current * 100)}%**",
-            ephemeral=True
-        )
-        return
-
-    # Modification : réservée aux admins
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message(
-            "🚫 Réservé aux administrateurs pour modifier le volume.",
-            ephemeral=True
-        )
-        return
-
-    if not 0 <= pourcentage <= 200:
-        await interaction.response.send_message(
-            "❌ Le volume doit être compris entre 0 et 200.",
-            ephemeral=True
-        )
-        return
-
-    await db.set_config(str(interaction.guild_id), "volume", pourcentage)
-    applied = player.set_volume(pourcentage)
-
-    note = "\n⚠️ Au-dessus de 100%, le son peut saturer." if pourcentage > 100 else ""
-    await interaction.response.send_message(
-        f"🔊 Volume réglé sur **{round(applied * 100)}%**.{note}",
-        ephemeral=True
-    )
 
 
 @bot.tree.command(name="cleanup", description="Nettoie les fichiers et entrées orphelins (Admin).")
@@ -1509,11 +1563,13 @@ class SoundSelectorView(discord.ui.View):
         self.clear_items()
         
         if not self.all_sounds:
-            options = [discord.SelectOption(label="Aucun son disponible", value="none", disabled=True)]
+            # SelectOption n'accepte pas `disabled`: c'est le Select lui-même
+            # qui se désactive.
             self.add_item(discord.ui.Select(
                 placeholder="Aucun son disponible",
                 custom_id="sound_select",
-                options=options,
+                options=[discord.SelectOption(label="Aucun son disponible", value="none")],
+                disabled=True,
                 row=0
             ))
         else:
@@ -1748,11 +1804,13 @@ class RenameSoundView(discord.ui.View):
         self.clear_items()
         
         if not self.all_sounds:
-            options = [discord.SelectOption(label="Aucun son disponible", value="none", disabled=True)]
+            # SelectOption n'accepte pas `disabled`: c'est le Select lui-même
+            # qui se désactive.
             self.add_item(discord.ui.Select(
                 placeholder="Aucun son disponible",
                 custom_id="sound_select",
-                options=options,
+                options=[discord.SelectOption(label="Aucun son disponible", value="none")],
+                disabled=True,
                 row=0
             ))
         else:
@@ -2258,6 +2316,233 @@ class OwnerPanelView(discord.ui.View):
         else:
             await interaction.response.edit_message(embed=embed, view=self)
 
+class ResetConfirmView(discord.ui.View):
+    """
+    Confirmation en deux temps de la remise à zéro.
+
+    Le bouton n'agit que si le propriétaire retape le mot de confirmation
+    dans une modale : un clic accidentel sur une action irréversible ne
+    suffit pas.
+    """
+
+    CONFIRM_WORD = "RESET"
+
+    def __init__(self, bot, db, scope: str, guild_id: Optional[int], delete_files: bool, owner_id: int):
+        super().__init__(timeout=60)
+        self.bot = bot
+        self.db = db
+        self.scope = scope              # "guild" ou "all"
+        self.guild_id = guild_id
+        self.delete_files = delete_files
+        self.owner_id = owner_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        """Seul le propriétaire qui a lancé la commande peut confirmer."""
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                "⛔ Cette confirmation ne vous appartient pas.", ephemeral=True
+            )
+            return False
+        return True
+
+    @discord.ui.button(label="Confirmer la remise à zéro", style=discord.ButtonStyle.danger, emoji="⚠️")
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(ResetConfirmModal(self))
+
+    @discord.ui.button(label="Annuler", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.stop()
+        await interaction.response.edit_message(
+            content="❌ Remise à zéro annulée.", embed=None, view=None
+        )
+
+    async def run_reset(self, interaction: discord.Interaction) -> None:
+        """
+        Exécute la remise à zéro : players, base, puis fichiers.
+
+        Args:
+            interaction: Interaction de la modale de confirmation
+        """
+        await interaction.response.defer(ephemeral=True)
+        self.stop()
+
+        report = []
+
+        # 1. Couper la lecture et libérer les salons vocaux
+        if self.scope == "all":
+            await self.bot.player_manager.disconnect_all()
+            report.append("🔌 Tous les players déconnectés")
+        else:
+            player = self.bot.player_manager.find_player(self.guild_id)
+            if player is not None:
+                player.queue.clear()
+                await player.disconnect()
+                self.bot.player_manager.players.pop(int(self.guild_id), None)
+            report.append("🔌 Player du serveur déconnecté")
+
+        # 2. Base de données
+        if self.scope == "all":
+            counts = await self.db.reset_all()
+        else:
+            counts = await self.db.delete_guild_data(str(self.guild_id))
+        report.append(
+            f"🗄️ Base: {counts.get('sounds', 0)} son(s), "
+            f"{counts.get('routines', 0)} routine(s), "
+            f"{counts.get('ignored_channels', 0)} salon(s) ignoré(s), "
+            f"{counts.get('guild_configs', 0)} config(s)"
+        )
+
+        # 3. Fichiers audio, si demandé
+        if self.delete_files:
+            deleted, errors = 0, 0
+            if self.scope == "all":
+                targets = []
+                if os.path.isdir(Config.SOUNDS_DIR):
+                    targets = [
+                        os.path.join(Config.SOUNDS_DIR, d)
+                        for d in os.listdir(Config.SOUNDS_DIR)
+                        if os.path.isdir(os.path.join(Config.SOUNDS_DIR, d))
+                    ]
+            else:
+                targets = [os.path.join(Config.SOUNDS_DIR, str(self.guild_id))]
+
+            for directory in targets:
+                if not os.path.isdir(directory):
+                    continue
+                for filename in os.listdir(directory):
+                    path = os.path.join(directory, filename)
+                    try:
+                        if os.path.isfile(path):
+                            os.remove(path)
+                            deleted += 1
+                    except OSError as e:
+                        errors += 1
+                        logger.error(f"Suppression impossible de {path}: {e}")
+
+            report.append(f"📂 Fichiers: {deleted} supprimé(s)"
+                          + (f", {errors} en erreur" if errors else ""))
+        else:
+            report.append("📂 Fichiers audio conservés sur le disque")
+
+        # 4. Recharger les routines en mémoire
+        await self.bot.routine_manager.load_routines()
+        report.append("🔄 Routines rechargées")
+
+        scope_label = "**tous les serveurs**" if self.scope == "all" else "ce serveur"
+        logger.warning(
+            f"⚠️ Remise à zéro effectuée par {interaction.user} "
+            f"(portée={self.scope}, fichiers={self.delete_files})"
+        )
+
+        embed = discord.Embed(
+            title="✅ Remise à zéro effectuée",
+            description=f"Portée : {scope_label}\n\n" + "\n".join(report),
+            color=discord.Color.green()
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+class ResetConfirmModal(discord.ui.Modal, title="Confirmer la remise à zéro"):
+    """Demande de retaper le mot de confirmation avant d'effacer."""
+
+    mot = discord.ui.TextInput(
+        label="Tapez RESET pour confirmer",
+        placeholder="RESET",
+        max_length=10
+    )
+
+    def __init__(self, view: ResetConfirmView):
+        super().__init__()
+        self.view = view
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if self.mot.value.strip().upper() != self.view.CONFIRM_WORD:
+            await interaction.response.send_message(
+                "❌ Mot de confirmation incorrect. Rien n'a été supprimé.",
+                ephemeral=True
+            )
+            return
+
+        await self.view.run_reset(interaction)
+
+
+@bot.tree.command(
+    name="owner_reset",
+    description="Remet le bot à zéro : sons, routines et configs (Owner uniquement)."
+)
+@app_commands.describe(
+    portee="Serveur actuel, ou tous les serveurs du bot.",
+    supprimer_fichiers="Supprimer aussi les fichiers audio du disque (irréversible)."
+)
+@app_commands.choices(portee=[
+    app_commands.Choice(name="Ce serveur uniquement", value="guild"),
+    app_commands.Choice(name="Tous les serveurs", value="all"),
+])
+async def owner_reset(
+    interaction: discord.Interaction,
+    portee: app_commands.Choice[str],
+    supprimer_fichiers: bool = False
+) -> None:
+    """Remise à zéro complète, réservée au propriétaire du bot."""
+    if not await bot.is_owner(interaction.user):
+        await interaction.response.send_message(
+            "⛔ Cette commande est réservée au propriétaire du bot.",
+            ephemeral=True
+        )
+        return
+
+    scope = portee.value
+
+    if scope == "guild" and not interaction.guild_id:
+        await interaction.response.send_message(
+            "❌ La portée « ce serveur » nécessite d'être dans un serveur.",
+            ephemeral=True
+        )
+        return
+
+    # Aperçu de ce qui va disparaître
+    if scope == "all":
+        counts = await db.count_all()
+        cible = f"**tous les serveurs** ({len(bot.guilds)} connecté(s))"
+    else:
+        counts = await db.count_for_guild(str(interaction.guild_id))
+        cible = f"**{interaction.guild.name}**"
+
+    embed = discord.Embed(
+        title="⚠️ Remise à zéro du bot",
+        description=f"Cible : {cible}\n\nCette action est **irréversible**.",
+        color=discord.Color.red()
+    )
+    embed.add_field(
+        name="Seront supprimés",
+        value=(
+            f"• {counts['sounds']} son(s) en base\n"
+            f"• {counts['routines']} routine(s)\n"
+            f"• {counts['ignored_channels']} salon(s) ignoré(s)\n"
+            f"• {counts['guild_configs']} configuration(s)"
+        ),
+        inline=False
+    )
+    embed.add_field(
+        name="Fichiers audio",
+        value=(
+            "🗑️ **Supprimés du disque également**"
+            if supprimer_fichiers else
+            "💾 Conservés sur le disque (`/sync` permettra de les réimporter)"
+        ),
+        inline=False
+    )
+    embed.set_footer(text="Confirmation requise · expire dans 60 secondes")
+
+    view = ResetConfirmView(
+        bot, db, scope,
+        interaction.guild_id,
+        supprimer_fichiers,
+        interaction.user.id
+    )
+    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+
 @bot.tree.command(name="owner_manage", description="Ouvre le panel de gestion (Owner uniquement).")
 async def owner_manage(interaction: discord.Interaction):
     if not await bot.is_owner(interaction.user):
@@ -2323,6 +2608,42 @@ class RoutineCreationView(discord.ui.View):
         
         self.update_components()
 
+    def _add_nav_bar(self, row: int) -> None:
+        """
+        Ajoute la barre de navigation d'un sous-menu.
+
+        Permet de passer directement d'une section à l'autre et de
+        sauvegarder sans repasser par le menu principal.
+
+        Args:
+            row: Ligne où placer la barre (doit être la dernière occupée)
+        """
+        self.add_item(discord.ui.Button(
+            label="Retour", style=discord.ButtonStyle.secondary,
+            custom_id="back", row=row
+        ))
+
+        # Les deux autres sections, celle en cours exclue
+        sections = [
+            ("menu_triggers", "Triggers", "⚡", "triggers"),
+            ("menu_conditions", "Conditions", "🤔", "conditions"),
+            ("menu_actions", "Actions", "🎬", "actions"),
+        ]
+        for custom_id, label, emoji, mode in sections:
+            if mode == self.mode:
+                continue
+            self.add_item(discord.ui.Button(
+                label=label, style=discord.ButtonStyle.primary,
+                custom_id=custom_id, emoji=emoji, row=row
+            ))
+
+        # Sauvegarde accessible depuis n'importe quelle section
+        self.add_item(discord.ui.Button(
+            label="Sauvegarder", style=discord.ButtonStyle.success,
+            custom_id="save", emoji="💾", row=row,
+            disabled=(not self.triggers or not self.actions)
+        ))
+
     def update_components(self):
         self.clear_items()
         
@@ -2338,11 +2659,13 @@ class RoutineCreationView(discord.ui.View):
 
         elif self.mode == "triggers":
             # Trigger Management
+            # Les 5 boutons tiennent sur une seule ligne. La row 4 doit
+            # rester libre : le menu déroulant "Event" s'y insère.
             self.add_item(discord.ui.Button(label="Timer", style=discord.ButtonStyle.success, custom_id="add_timer", emoji="⏰", row=0))
-            self.add_item(discord.ui.Button(label="Heure fixe", style=discord.ButtonStyle.success, custom_id="add_schedule", emoji="🕐", row=0))
+            self.add_item(discord.ui.Button(label="Heure", style=discord.ButtonStyle.success, custom_id="add_schedule", emoji="🕐", row=0))
             self.add_item(discord.ui.Button(label="Event", style=discord.ButtonStyle.success, custom_id="add_event", emoji="📥", row=0))
-            self.add_item(discord.ui.Button(label="Nb membres", style=discord.ButtonStyle.success, custom_id="add_count", emoji="👥", row=0))
-            self.add_item(discord.ui.Button(label="Mot-clé / Réaction", style=discord.ButtonStyle.success, custom_id="add_keyword", emoji="💬", row=4))
+            self.add_item(discord.ui.Button(label="Membres", style=discord.ButtonStyle.success, custom_id="add_count", emoji="👥", row=0))
+            self.add_item(discord.ui.Button(label="Mot-clé", style=discord.ButtonStyle.success, custom_id="add_keyword", emoji="💬", row=0))
             
             # Selection for deletion/move
             if self.triggers:
@@ -2355,7 +2678,8 @@ class RoutineCreationView(discord.ui.View):
                 
                 self.add_item(discord.ui.Button(label="Supprimer", style=discord.ButtonStyle.danger, custom_id="delete_item", row=2))
             
-            self.add_item(discord.ui.Button(label="Retour", style=discord.ButtonStyle.secondary, custom_id="back", row=3))
+            # row 4 reste libre pour le menu déroulant "Event"
+            self._add_nav_bar(row=3)
 
         elif self.mode == "conditions":
             # Condition Management
@@ -2392,7 +2716,7 @@ class RoutineCreationView(discord.ui.View):
                 self.add_item(discord.ui.Button(label="Descendre", style=discord.ButtonStyle.secondary, custom_id="move_down", row=2))
                 self.add_item(discord.ui.Button(label="Supprimer", style=discord.ButtonStyle.danger, custom_id="delete_item", row=2))
 
-            self.add_item(discord.ui.Button(label="Retour", style=discord.ButtonStyle.secondary, custom_id="back", row=3))
+            self._add_nav_bar(row=3)
 
         elif self.mode == "actions":
             # Action Management
@@ -2401,8 +2725,14 @@ class RoutineCreationView(discord.ui.View):
             self.add_item(discord.ui.Button(label="Message", style=discord.ButtonStyle.success, custom_id="add_action_msg", emoji="💬", row=0))
             self.add_item(discord.ui.Button(label="Chance", style=discord.ButtonStyle.success, custom_id="add_action_chance", emoji="🎲", row=0))
             self.add_item(discord.ui.Button(label="Volume", style=discord.ButtonStyle.success, custom_id="add_action_volume", emoji="🔊", row=0))
-            self.add_item(discord.ui.Button(label="Contrôle", style=discord.ButtonStyle.primary, custom_id="add_action_control", emoji="🎛️", row=4))
-            self.add_item(discord.ui.Button(label="Déplacer", style=discord.ButtonStyle.primary, custom_id="add_action_move", emoji="↔️", row=4))
+            
+            # Contrôles de lecture : des boutons directs plutôt qu'un menu
+            # déroulant, qui n'aurait plus de ligne libre où s'insérer.
+            self.add_item(discord.ui.Button(label="Stop", style=discord.ButtonStyle.primary, custom_id="act_stop", emoji="⏹️", row=1))
+            self.add_item(discord.ui.Button(label="Skip", style=discord.ButtonStyle.primary, custom_id="act_skip", emoji="⏭️", row=1))
+            self.add_item(discord.ui.Button(label="Vider", style=discord.ButtonStyle.primary, custom_id="act_clear", emoji="🧹", row=1))
+            self.add_item(discord.ui.Button(label="Quitter", style=discord.ButtonStyle.primary, custom_id="act_leave", emoji="🚪", row=1))
+            self.add_item(discord.ui.Button(label="Déplacer", style=discord.ButtonStyle.primary, custom_id="add_action_move", emoji="↔️", row=1))
 
             if self.actions:
                 options = []
@@ -2410,70 +2740,24 @@ class RoutineCreationView(discord.ui.View):
                     label = f"{i+1}. {self.format_action(a)}"
                     options.append(discord.SelectOption(label=label[:100], value=str(i)))
                 
-                self.add_item(discord.ui.Select(placeholder="Sélectionner une action", custom_id="select_item", options=options, row=1))
+                self.add_item(discord.ui.Select(placeholder="Sélectionner une action", custom_id="select_item", options=options, row=2))
                 
-                self.add_item(discord.ui.Button(label="Monter", style=discord.ButtonStyle.secondary, custom_id="move_up", row=2))
-                self.add_item(discord.ui.Button(label="Descendre", style=discord.ButtonStyle.secondary, custom_id="move_down", row=2))
-                self.add_item(discord.ui.Button(label="Supprimer", style=discord.ButtonStyle.danger, custom_id="delete_item", row=2))
+                self.add_item(discord.ui.Button(label="Monter", style=discord.ButtonStyle.secondary, custom_id="move_up", row=3))
+                self.add_item(discord.ui.Button(label="Descendre", style=discord.ButtonStyle.secondary, custom_id="move_down", row=3))
+                self.add_item(discord.ui.Button(label="Supprimer", style=discord.ButtonStyle.danger, custom_id="delete_item", row=3))
 
-            self.add_item(discord.ui.Button(label="Retour", style=discord.ButtonStyle.secondary, custom_id="back", row=3))
+            self._add_nav_bar(row=4)
 
     def format_trigger(self, t):
-        if t['type'] == 'timer':
-            return f"⏰ Timer: {format_duration(t['data'].get('interval_seconds', 0))}"
-        elif t['type'] == 'schedule':
-            days = t['data'].get('days') or []
-            day_names = ["lun", "mar", "mer", "jeu", "ven", "sam", "dim"]
-            when = ",".join(day_names[d] for d in days) + " " if days else ""
-            return f"🕐 À {when}{t['data'].get('time')}"
-        elif t['type'] == 'event':
-            event = t['data'].get('event', '')
-            event_labels = {
-                'voice_join': '🟢 Join Vocal',
-                'voice_leave': '🔴 Leave Vocal',
-                'voice_move': '🔀 Move Vocal',
-                'voice_mute': '🔇 Mute',
-                'voice_unmute': '🔊 Unmute',
-                'voice_deafen': '🚫 Deafen',
-                'voice_undeafen': '🎧 Undeafen',
-                'voice_stream_start': '📺 Stream Start',
-                'voice_stream_stop': '📵 Stream Stop',
-                'voice_video_start': '📹 Vidéo Start',
-                'voice_video_stop': '📷 Vidéo Stop',
-                'voice_first_join': '🥇 Premier arrivé',
-                'voice_count_reached': f"👥 {t['data'].get('count', '?')} membres",
-                'message': f"💬 Mot-clé « {t['data'].get('keyword', '')} »",
-                'reaction': f"⭐ Réaction {t['data'].get('emoji', '')}"
-            }
-            return f"Event: {event_labels.get(event, event)}"
-        return "Inconnu"
+        """Décrit un trigger du panel (même rendu que /routine_list)."""
+        return describe_trigger(t.get('type'), t.get('data', {}))
 
     def format_condition(self, c):
         return f"{c['type']} {c['op']} {c['value']}"
 
     def format_action(self, a):
-        if a['type'] == 'play_sound':
-            if a['sound_name'] == '__random__':
-                return "🎲 Joue: Random 🔥"
-            return f"Joue: {a['sound_name']}"
-        if a['type'] == 'wait':
-            if a.get('delay_min') is not None:
-                return f"Pause: {format_duration(a['delay_min'])}-{format_duration(a['delay_max'])}"
-            return f"Pause: {format_duration(a.get('delay', 0))}"
-        if a['type'] == 'message': return f"Msg: {a['content']}"
-        if a['type'] == 'dm': return f"MP: {a['content']}"
-        if a['type'] == 'chance': return f"🎲 Chance: {a.get('percent')}%"
-        if a['type'] == 'volume':
-            value = a.get('value')
-            return "🔊 Volume: reset" if value == 'reset' else f"🔊 Volume: {value}%"
-        if a['type'] == 'move':
-            cible = "membre" if a.get('target') == 'member' else "bot"
-            return f"↔️ Déplacer {cible}"
-        if a['type'] == 'player_control':
-            labels = {'stop': '⏹️ Stop', 'skip': '⏭️ Skip',
-                      'clear': '🧹 Vider la file', 'leave': '🚪 Quitter le salon'}
-            return labels.get(a.get('command'), 'Contrôle')
-        return "Action"
+        """Décrit une action du panel (même rendu qu'ailleurs)."""
+        return describe_action(a)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.type == discord.InteractionType.component:
@@ -2519,7 +2803,7 @@ class RoutineCreationView(discord.ui.View):
                 return False
             elif cid == "add_event":
                 # Quick select for event
-                self.add_item(discord.ui.Select(placeholder="Choisir l'événement", custom_id="quick_select_event", options=[
+                self.add_item(discord.ui.Select(placeholder="Choisir l'événement", custom_id="quick_select_event", row=4, options=[
                     discord.SelectOption(label="🥇 Premier arrivé", value="voice_first_join", description="Le premier humain dans un salon vide"),
                     discord.SelectOption(label="🟢 Join Vocal", value="voice_join", description="Quand quelqu'un rejoint un salon"),
                     discord.SelectOption(label="🔴 Leave Vocal", value="voice_leave", description="Quand quelqu'un quitte un salon"),
@@ -2586,20 +2870,25 @@ class RoutineCreationView(discord.ui.View):
                 await interaction.response.send_modal(ChanceInputModal(self))
                 return False
             elif cid == "add_action_volume":
-                await interaction.response.send_modal(VolumeInputModal(self))
+                # Le plafond du serveur est lu ici: la modale n'a pas accès
+                # à la base une fois ouverte.
+                ceiling = await self.bot.player_manager.get_player(
+                    self.guild_id
+                ).get_max_volume()
+                await interaction.response.send_modal(VolumeInputModal(self, ceiling))
                 return False
             elif cid == "add_action_move":
                 await interaction.response.send_modal(MoveInputModal(self))
                 return False
-            elif cid == "add_action_control":
-                self.add_item(discord.ui.Select(placeholder="Choisir un contrôle", custom_id="quick_select_control", options=[
-                    discord.SelectOption(label="⏹️ Stop", value="stop", description="Arrête la lecture et vide la file"),
-                    discord.SelectOption(label="⏭️ Skip", value="skip", description="Passe au son suivant"),
-                    discord.SelectOption(label="🧹 Vider la file", value="clear", description="Vide la file sans couper le son"),
-                    discord.SelectOption(label="🚪 Quitter le salon", value="leave", description="Le bot se déconnecte du vocal")
-                ]))
-                await interaction.response.edit_message(view=self)
+            elif cid == "act_leave":
+                # Deux comportements possibles : la modale tranche
+                await interaction.response.send_modal(LeaveInputModal(self))
                 return False
+            elif cid in ("act_stop", "act_skip", "act_clear"):
+                self.actions.append({
+                    "type": "player_control",
+                    "command": cid.removeprefix("act_")
+                })
 
             # List Management (Select)
             elif cid == "select_item":
@@ -2628,11 +2917,6 @@ class RoutineCreationView(discord.ui.View):
                 val = interaction.data["values"][0]
                 self.triggers.append({"type": "event", "data": {"event": val}})
                 # Remove the select by updating components
-            elif cid == "quick_select_control":
-                self.actions.append({
-                    "type": "player_control",
-                    "command": interaction.data["values"][0]
-                })
             elif cid == "quick_select_sound":
                 val = interaction.data["values"][0]
                 if val != "none":
@@ -2853,82 +3137,128 @@ class RoutineCreationView(discord.ui.View):
         return None
 
     async def _show_sound_selector(self, interaction: discord.Interaction):
-        """Affiche le sélecteur de sons avec pagination."""
-        # Remove any existing sound selector
-        self.clear_items()
-        
+        """
+        Affiche le sélecteur de sons paginé.
+
+        Ne démonte la vue qu'une fois certain de pouvoir la reconstruire :
+        une exception après clear_items() laisserait un message dont tous
+        les boutons pointent vers une vue vide ("unknown view").
+        """
+        # Aucun son : inutile d'afficher un menu vide, on le signale et on
+        # reste sur le menu des actions.
         if not self.all_sounds:
-            # No sounds available
-            options = [discord.SelectOption(label="Aucun son disponible", value="none", disabled=True)]
-            self.add_item(discord.ui.Select(
-                placeholder="Aucun son disponible", 
-                custom_id="quick_select_sound", 
-                options=options
+            self.mode = "actions"
+            self.update_components()
+            await interaction.response.send_message(
+                "🔇 Aucun son disponible sur ce serveur. Ajoutez-en avec "
+                "`/add_sound`, ou importez les fichiers existants avec `/sync`.",
+                ephemeral=True
+            )
+            return
+
+        # Pagination
+        total_pages = (len(self.all_sounds) - 1) // self.sounds_per_page + 1
+        self.sound_page = max(0, min(self.sound_page, total_pages - 1))
+        start_idx = self.sound_page * self.sounds_per_page
+        page_sounds = self.all_sounds[start_idx:start_idx + self.sounds_per_page]
+
+        # Options de la page courante ("Random" seulement sur la première)
+        options = []
+        if self.sound_page == 0:
+            options.append(discord.SelectOption(
+                label="Random 🔥",
+                value="__random__",
+                emoji="🎲"
             ))
-        else:
-            # Calculate pagination
-            start_idx = self.sound_page * self.sounds_per_page
-            end_idx = start_idx + self.sounds_per_page
-            page_sounds = self.all_sounds[start_idx:end_idx]
-            total_pages = (len(self.all_sounds) - 1) // self.sounds_per_page + 1
-            
-            # Build options for current page - add Random option on first page
-            options = []
-            if self.sound_page == 0:
-                options.append(discord.SelectOption(
-                    label="Random 🔥", 
-                    value="__random__", 
-                    emoji="🎲"
-                ))
-            
-            options.extend([discord.SelectOption(label=name[:100], value=name) for name in page_sounds])
-            
-            self.add_item(discord.ui.Select(
-                placeholder=f"Choisir un son (Page {self.sound_page + 1}/{total_pages})", 
-                custom_id="quick_select_sound", 
-                options=options,
-                row=0
+        options.extend(
+            discord.SelectOption(label=name[:100], value=name[:100])
+            for name in page_sounds
+        )
+
+        # Tout est construit : on peut remplacer les composants
+        self.clear_items()
+
+        self.add_item(discord.ui.Select(
+            placeholder=f"Choisir un son (Page {self.sound_page + 1}/{total_pages})",
+            custom_id="quick_select_sound",
+            options=options,
+            row=0
+        ))
+
+        if total_pages > 1:
+            self.add_item(discord.ui.Button(
+                label="◀️ Précédent",
+                style=discord.ButtonStyle.secondary,
+                custom_id="sound_page_prev",
+                disabled=self.sound_page == 0,
+                row=1
             ))
-            
-            # Add pagination buttons if needed
-            if total_pages > 1:
-                prev_disabled = self.sound_page == 0
-                next_disabled = self.sound_page >= total_pages - 1
-                
-                self.add_item(discord.ui.Button(
-                    label="◀️ Précédent", 
-                    style=discord.ButtonStyle.secondary, 
-                    custom_id="sound_page_prev",
-                    disabled=prev_disabled,
-                    row=1
-                ))
-                self.add_item(discord.ui.Button(
-                    label=f"Page {self.sound_page + 1}/{total_pages}", 
-                    style=discord.ButtonStyle.secondary, 
-                    custom_id="sound_page_info",
-                    disabled=True,
-                    row=1
-                ))
-                self.add_item(discord.ui.Button(
-                    label="Suivant ▶️", 
-                    style=discord.ButtonStyle.secondary, 
-                    custom_id="sound_page_next",
-                    disabled=next_disabled,
-                    row=1
-                ))
-        
-        # Add back button
+            self.add_item(discord.ui.Button(
+                label=f"Page {self.sound_page + 1}/{total_pages}",
+                style=discord.ButtonStyle.secondary,
+                custom_id="sound_page_info",
+                disabled=True,
+                row=1
+            ))
+            self.add_item(discord.ui.Button(
+                label="Suivant ▶️",
+                style=discord.ButtonStyle.secondary,
+                custom_id="sound_page_next",
+                disabled=self.sound_page >= total_pages - 1,
+                row=1
+            ))
+
         self.add_item(discord.ui.Button(
-            label="Annuler", 
-            style=discord.ButtonStyle.danger, 
+            label="Annuler",
+            style=discord.ButtonStyle.danger,
             custom_id="back",
             row=2
         ))
-        
+
         if interaction.response.is_done():
             await interaction.edit_original_response(view=self)
         else:
             await interaction.response.edit_message(view=self)
+
+    async def on_error(
+        self,
+        interaction: discord.Interaction,
+        error: Exception,
+        item: discord.ui.Item
+    ) -> None:
+        """
+        Rattrape toute erreur d'un composant du panel.
+
+        Sans ce filet, une exception laisse la vue dans un état incohérent
+        (souvent sans composants) et tous les boutons suivants deviennent
+        inertes avec un « unknown view ».
+        """
+        logger.error(
+            f"Erreur dans le panel de routine (item={getattr(item, 'label', item)}): {error}",
+            exc_info=error
+        )
+
+        # Restaurer une vue cohérente
+        try:
+            self.mode = "main"
+            self.selected_index = None
+            self.all_sounds = []
+            self.sound_page = 0
+            self.update_components()
+        except Exception:
+            logger.exception("Restauration du panel impossible")
+
+        message = (
+            "❌ Une erreur est survenue dans le panel. "
+            "Il a été réinitialisé, vos modifications en cours sont conservées."
+        )
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(message, ephemeral=True)
+            else:
+                await interaction.response.send_message(message, ephemeral=True)
+        except discord.HTTPException:
+            pass
 
     async def refresh_embed(self, interaction: discord.Interaction):
         embed = discord.Embed(title=f"🛠️ {self.name}", color=discord.Color.blue())
@@ -2941,6 +3271,9 @@ class RoutineCreationView(discord.ui.View):
         if not self.triggers: desc += "*Aucun déclencheur*\n"
         for i, t in enumerate(self.triggers):
             desc += f"`{i+1}.` {self.format_trigger(t)}\n"
+        if len(self.triggers) > 1:
+            # La base ne stocke qu'un déclencheur par routine
+            desc += "⚠️ *Seul le trigger n°1 sera enregistré.*\n"
         
         # Conditions - show with C1, C2, etc. for advanced mode
         if self.advanced_logic_expr:
@@ -2975,6 +3308,15 @@ class RoutineCreationView(discord.ui.View):
             await interaction.response.edit_message(embed=embed, view=self)
 
     async def save_routine(self, interaction: discord.Interaction):
+        # Le bouton est désactivé dans ce cas, mais une vue restaurée après
+        # erreur pourrait le réactiver: on ne fait pas confiance à l'UI seule.
+        if not self.triggers or not self.actions:
+            await interaction.response.send_message(
+                "❌ Une routine a besoin d'au moins un déclencheur et une action.",
+                ephemeral=True
+            )
+            return
+
         primary_trigger = self.triggers[0]
         
         # Compile conditions using advanced expression or simple mode
@@ -3109,20 +3451,14 @@ class KeywordInputModal(discord.ui.Modal, title="Mot-clé ou réaction"):
             await interaction.response.send_message("❌ Valeur manquante.", ephemeral=True)
             return
 
+        warn_intent = False
+        
         if kind.startswith("mess"):
             self.view.triggers.append({
                 "type": "event",
                 "data": {"event": "message", "keyword": value}
             })
-            if not Config.MESSAGE_CONTENT_INTENT:
-                await interaction.response.send_message(
-                    "⚠️ Trigger ajouté, mais l'intent « Message Content » est désactivé : "
-                    "il ne se déclenchera pas tant que MESSAGE_CONTENT_INTENT=true n'est pas "
-                    "défini et l'intent coché dans le portail Discord.",
-                    ephemeral=True
-                )
-                self.view.update_components()
-                return
+            warn_intent = not Config.MESSAGE_CONTENT_INTENT
         elif kind.startswith("react"):
             self.view.triggers.append({
                 "type": "event",
@@ -3135,6 +3471,15 @@ class KeywordInputModal(discord.ui.Modal, title="Mot-clé ou réaction"):
 
         self.view.update_components()
         await self.view.refresh_embed(interaction)
+        
+        # Le panel est à jour : on peut prévenir en message de suivi
+        if warn_intent:
+            await interaction.followup.send(
+                "⚠️ Trigger ajouté, mais l'intent « Message Content » est désactivé : "
+                "il ne se déclenchera pas tant que MESSAGE_CONTENT_INTENT=true n'est pas "
+                "défini et l'intent coché dans le portail développeur Discord.",
+                ephemeral=True
+            )
 
 class ConditionInputModal(discord.ui.Modal, title="Ajouter Condition"):
     c_type = discord.ui.TextInput(
@@ -3246,22 +3591,38 @@ class ChanceInputModal(discord.ui.Modal, title="Probabilité"):
 
 
 class VolumeInputModal(discord.ui.Modal, title="Changer le volume"):
-    value = discord.ui.TextInput(
-        label="Volume 0-200, ou 'reset'",
-        placeholder="150"
-    )
-
-    def __init__(self, view):
+    def __init__(self, view, max_volume: int = None):
+        """
+        Args:
+            view: Panel appelant
+            max_volume: Plafond du serveur, lu avant l'ouverture de la modale
+                (une modale ne peut pas interroger la base elle-même).
+        """
         super().__init__()
         self.view = view
+        self.max_volume = (
+            Config.DEFAULT_MAX_VOLUME if max_volume is None else int(max_volume)
+        )
+
+        # Champ construit ici pour que le libellé reflète le plafond réel
+        # du serveur, sans passer par un setter déprécié.
+        self.value = discord.ui.TextInput(
+            label=f"Volume 0-{self.max_volume}, ou 'reset'",
+            placeholder="150"
+        )
+        self.add_item(self.value)
 
     async def on_submit(self, interaction: discord.Interaction):
         raw = self.value.value.strip().lower()
 
         if raw != "reset":
-            if not raw.isdigit() or not 0 <= int(raw) <= 200:
+            if not raw.isdigit() or not 0 <= int(raw) <= self.max_volume:
                 await interaction.response.send_message(
-                    "❌ Indiquez un entier entre 0 et 200, ou « reset ».", ephemeral=True)
+                    f"❌ Indiquez un entier entre 0 et {self.max_volume} "
+                    "(volume maximum du serveur), ou « reset ». "
+                    "Ce plafond se règle avec `/config`.",
+                    ephemeral=True
+                )
                 return
             raw = int(raw)
 
@@ -3295,6 +3656,33 @@ class MoveInputModal(discord.ui.Modal, title="Déplacer vers un salon"):
         self.view.actions.append({"type": "move", "target": target, "channel_id": cid})
         self.view.update_components()
         await self.view.refresh_embed(interaction)
+
+class LeaveInputModal(discord.ui.Modal, title="Quitter le salon vocal"):
+    """Choix entre quitter après la file et quitter tout de suite."""
+
+    attendre = discord.ui.TextInput(
+        label="Attendre la fin des sons ? (oui / non)",
+        placeholder="oui",
+        required=False,
+        default="oui",
+        max_length=5
+    )
+
+    def __init__(self, view):
+        super().__init__()
+        self.view = view
+
+    async def on_submit(self, interaction: discord.Interaction):
+        raw = (self.attendre.value or "oui").strip().lower()
+        attendre = not raw.startswith(("n", "no"))
+
+        self.view.actions.append({
+            "type": "player_control",
+            "command": "leave" if attendre else "leave_now"
+        })
+        self.view.update_components()
+        await self.view.refresh_embed(interaction)
+
 
 class MessageInputModal(discord.ui.Modal, title="Ajouter Message"):
     content = discord.ui.TextInput(label="Message", placeholder="Coucou {user}!")

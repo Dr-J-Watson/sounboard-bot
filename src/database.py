@@ -38,7 +38,8 @@ class DatabaseManager:
     
     # Clés de configuration valides pour éviter les injections SQL
     VALID_CONFIG_KEYS = frozenset({
-        "max_duration", "max_file_size_mb", "max_name_length", "volume"
+        "max_duration", "max_file_size_mb", "max_name_length",
+        "volume", "max_volume"
     })
     
     def __init__(self, db_path: str):
@@ -122,6 +123,7 @@ class DatabaseManager:
                     max_file_size_mb INTEGER,
                     max_name_length INTEGER,
                     volume INTEGER,
+                    max_volume INTEGER,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
@@ -199,12 +201,15 @@ class DatabaseManager:
             except Exception:
                 pass
             
-            # Ajouter volume si manquant
-            try:
-                await db.execute("ALTER TABLE guild_configs ADD COLUMN volume INTEGER")
-                logger.info("Migration: colonne volume ajoutée à guild_configs")
-            except Exception:
-                pass
+            # Ajouter volume / max_volume si manquants
+            for column in ("volume", "max_volume"):
+                try:
+                    await db.execute(
+                        f"ALTER TABLE guild_configs ADD COLUMN {column} INTEGER"
+                    )
+                    logger.info(f"Migration: colonne {column} ajoutée à guild_configs")
+                except Exception:
+                    pass
             
             await db.commit()
             
@@ -619,7 +624,7 @@ class DatabaseManager:
         Args:
             guild_id: ID du serveur
             name: Nom de la routine
-            trigger_type: Type de déclencheur ("timer" ou "event")
+            trigger_type: Type de déclencheur ("timer", "schedule" ou "event")
             trigger_data: Données du déclencheur (intervalle, événement, etc.)
             actions: Liste des actions à exécuter
             conditions: Conditions optionnelles pour l'exécution
@@ -931,6 +936,68 @@ class DatabaseManager:
             await db.commit()
         
         logger.info(f"Données supprimées pour guild={guild_id}: {result}")
+        return result
+
+    async def reset_all(self) -> Dict[str, int]:
+        """
+        Vide entièrement la base : tous les serveurs, toutes les tables.
+
+        Réservé à la commande de remise à zéro du propriétaire du bot.
+        Le compteur d'auto-incrément est également réinitialisé pour que
+        les prochains IDs de routines repartent de 1.
+
+        Returns:
+            Dictionnaire du nombre de lignes supprimées par table
+        """
+        result = {}
+        async with self._get_connection() as db:
+            for table in ("sounds", "routines", "ignored_channels", "guild_configs"):
+                cursor = await db.execute(f"DELETE FROM {table}")
+                result[table] = cursor.rowcount
+
+            # Remise à zéro des AUTOINCREMENT (table absente si jamais utilisée)
+            try:
+                await db.execute("DELETE FROM sqlite_sequence")
+            except Exception:
+                pass
+
+            await db.commit()
+
+        logger.warning(f"⚠️ Base entièrement réinitialisée: {result}")
+        return result
+
+    async def count_all(self) -> Dict[str, int]:
+        """
+        Compte les lignes de chaque table, pour l'écran de confirmation.
+
+        Returns:
+            Dictionnaire {table: nombre de lignes}
+        """
+        result = {}
+        async with self._get_connection() as db:
+            for table in ("sounds", "routines", "ignored_channels", "guild_configs"):
+                async with db.execute(f"SELECT COUNT(*) FROM {table}") as cursor:
+                    result[table] = (await cursor.fetchone())[0]
+        return result
+
+    async def count_for_guild(self, guild_id: str) -> Dict[str, int]:
+        """
+        Compte les lignes d'un serveur, pour l'écran de confirmation.
+
+        Args:
+            guild_id: ID du serveur
+
+        Returns:
+            Dictionnaire {table: nombre de lignes}
+        """
+        result = {}
+        async with self._get_connection() as db:
+            for table in ("sounds", "routines", "ignored_channels", "guild_configs"):
+                async with db.execute(
+                    f"SELECT COUNT(*) FROM {table} WHERE guild_id = ?",
+                    (str(guild_id),)
+                ) as cursor:
+                    result[table] = (await cursor.fetchone())[0]
         return result
 
     # ==================== Salons Ignorés ====================
