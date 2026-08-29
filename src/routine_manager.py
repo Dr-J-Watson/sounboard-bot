@@ -1384,43 +1384,86 @@ class RoutineManager:
         Exécute une routine à la demande et rend compte de son déroulé.
 
         Les déclencheurs sont ignorés : seule la trame est jouée, comme si
-        l'un d'eux venait de se produire. C'est ce qui permet de vérifier
-        une routine sans attendre son heure ni provoquer l'événement.
+        l'un d'eux venait de se produire.
+
+        Le contexte est choisi comme le ferait un vrai déclenchement. Celui
+        qui lance le test n'est retenu que s'il peut satisfaire la trame :
+        tester une routine qui vise quelqu'un d'autre doit se faire avec
+        cette personne comme contexte, sinon le test échouerait toujours
+        alors que la routine, elle, fonctionne.
 
         Args:
             routine: Données de la routine
             guild: Serveur où l'exécuter
-            member: Membre à considérer comme déclencheur. Son salon vocal
-                sert de cible ; à défaut, un contexte est choisi comme pour
-                un déclencheur temporel.
+            member: Membre qui demande le test
 
         Returns:
             La liste des étapes, prête à être affichée
         """
-        context = None
+        wanted_users = self._wanted_ids(routine, 'user_id')
+        wanted_channels = self._wanted_ids(routine, 'channel_id')
 
-        if member is not None and getattr(member, 'voice', None) and member.voice.channel:
+        voice_channel = None
+        if member is not None and getattr(member, 'voice', None):
+            voice_channel = member.voice.channel
+
+        # Le demandeur convient-il comme contexte ?
+        invoker_fits = (
+            voice_channel is not None
+            and (not wanted_users or str(member.id) in wanted_users)
+            and (not wanted_channels or str(voice_channel.id) in wanted_channels)
+        )
+
+        if invoker_fits:
             context = RoutineContext(
-                guild=guild, channel=member.voice.channel, member=member
+                guild=guild, channel=voice_channel, member=member
             )
         else:
             context = await self._find_valid_context(routine, guild)
 
         if context is None:
-            return ["⚠️ Personne n'est connecté en vocal : "
-                    "aucun salon où jouer, la trame n'a pas été exécutée."]
+            if wanted_users:
+                return [
+                    "⚠️ Aucun des membres visés par la trame n'est connecté "
+                    "en vocal, et personne d'autre n'est disponible."
+                ]
+            return [
+                "⚠️ Personne n'est connecté en vocal : aucun salon où jouer, "
+                "la trame n'a pas été exécutée."
+            ]
 
         trace: List[str] = []
-        if member is not None and (context.member is not member):
-            trace.append(
-                f"ℹ️ *Contexte choisi automatiquement : "
-                f"{getattr(context.member, 'display_name', '?')} "
-                f"dans #{getattr(context.channel, 'name', '?')}*"
-            )
+
+        # Toujours annoncer le contexte : c'est lui qui décide du sort des
+        # conditions, et son choix n'a rien d'évident.
+        who = getattr(context.member, 'display_name', None) or "personne"
+        where = getattr(context.channel, 'name', '?')
+        trace.append(f"ℹ️ *Testé comme si **{who}** venait de déclencher, dans #{where}.*")
+
+        if not invoker_fits and member is not None:
+            chosen_id = str(getattr(context.member, 'id', ''))
+
+            if wanted_users and chosen_id not in wanted_users:
+                # Personne parmi les membres visés n'est là : le contexte de
+                # repli ne satisfera pas la condition, autant le dire.
+                trace.append(
+                    "⚠️ *Aucun membre visé par la trame n'est connecté ; "
+                    "un contexte de repli a été pris, les conditions sur le "
+                    "membre échoueront donc.*"
+                )
+            elif wanted_users:
+                trace.append(
+                    "ℹ️ *La trame vise d'autres membres que vous : le contexte "
+                    "a été choisi parmi eux.*"
+                )
+            elif voice_channel is None:
+                trace.append("ℹ️ *Vous n'êtes pas en vocal, un contexte a été choisi.*")
+
+        trace.append("")
 
         await self._execute_actions(routine, context, trace=trace)
 
-        return trace or ["*Aucun bloc n'a été exécuté.*"]
+        return trace
 
     async def _check_block_conditions(
         self,
