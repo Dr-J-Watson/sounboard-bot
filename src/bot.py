@@ -15,6 +15,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 import asyncio
+import copy
 import logging
 import os
 import re
@@ -26,11 +27,19 @@ from config import Config
 from database import DatabaseManager
 from audio_manager import AudioManager
 from player import PlayerManager
-from routine_manager import (
-    RoutineManager,
-    format_duration,
-    parse_duration_range,
+from routine_manager import RoutineManager
+from blocks import (
+    ACTION_MENU,
+    CONDITION_BLOCKS,
+    TRIGGER_MENU,
     WEEKDAYS,
+    action_syntax_help,
+    condition_syntax_help,
+    describe_action,
+    describe_condition,
+    describe_trigger,
+    parse_duration_range,
+    trigger_by_key,
 )
 
 # === Configuration du logging ===
@@ -144,12 +153,41 @@ class SoundboardBot(commands.Bot):
             except Exception as e:
                 logger.warning(f"⚠️ Impossible de charger Opus: {e}")
         
-        # Définir le statut
-        activity = discord.Activity(
-            type=discord.ActivityType.listening,
-            name="/play | /help"
-        )
-        await self.change_presence(activity=activity)
+        # Statut, entièrement paramétrable par variables d'environnement
+        await self._apply_presence()
+
+    async def _apply_presence(self) -> None:
+        """
+        Applique le statut configuré (ACTIVITY_TYPE, ACTIVITY_TEXT, STATUS).
+
+        Un texte vide retire l'activité sans toucher à la présence.
+        """
+        status = {
+            "online": discord.Status.online,
+            "idle": discord.Status.idle,
+            "dnd": discord.Status.dnd,
+            "invisible": discord.Status.invisible,
+        }.get(Config.STATUS, discord.Status.online)
+
+        text = (Config.ACTIVITY_TEXT or "").strip()
+        if not text:
+            await self.change_presence(status=status, activity=None)
+            logger.info(f"Statut appliqué: {Config.STATUS}, sans activité")
+            return
+
+        if Config.ACTIVITY_TYPE == "custom":
+            activity = discord.CustomActivity(name=text)
+        else:
+            activity_type = {
+                "playing": discord.ActivityType.playing,
+                "listening": discord.ActivityType.listening,
+                "watching": discord.ActivityType.watching,
+                "competing": discord.ActivityType.competing,
+            }.get(Config.ACTIVITY_TYPE, discord.ActivityType.listening)
+            activity = discord.Activity(type=activity_type, name=text)
+
+        await self.change_presence(status=status, activity=activity)
+        logger.info(f"Statut appliqué: {Config.ACTIVITY_TYPE} « {text} » ({Config.STATUS})")
 
     async def on_voice_state_update(
         self,
@@ -315,86 +353,36 @@ class SoundboardBot(commands.Bot):
         await super().close()
 
 
-def describe_action(action: dict) -> str:
+def render_flat_trame(flat: list, limit: int = 1000) -> str:
     """
-    Décrit une action de routine en une ligne lisible.
+    Rend une trame stockée à plat sous forme de liste indentée.
 
     Args:
-        action: Dictionnaire d'action
+        flat: Trame telle qu'enregistrée en base
+        limit: Longueur maximale du texte produit
 
     Returns:
-        Description courte de l'action
+        Texte prêt pour un embed
     """
-    a_type = action.get('type')
+    if not flat:
+        return "*Trame vide*"
 
-    if a_type == 'play_sound':
-        name = action.get('sound_name')
-        return "🎲 son aléatoire" if name == '__random__' else f"🎵 {name}"
-    if a_type == 'wait':
-        if action.get('delay_min') is not None:
-            return (f"💤 pause {format_duration(action['delay_min'])}"
-                    f"-{format_duration(action['delay_max'])}")
-        return f"💤 pause {format_duration(action.get('delay', 0))}"
-    if a_type == 'message':
-        return "💬 message"
-    if a_type == 'dm':
-        return "📩 message privé"
-    if a_type == 'chance':
-        return f"🎲 chance {action.get('percent')}%"
-    if a_type == 'volume':
-        value = action.get('value')
-        return "🔊 volume reset" if value == 'reset' else f"🔊 volume {value}%"
-    if a_type == 'move':
-        return "↔️ déplacer " + ("le membre" if action.get('target') == 'member' else "le bot")
-    if a_type == 'player_control':
-        labels = {
-            'stop': '⏹️ stop',
-            'skip': '⏭️ skip',
-            'clear': '🧹 vider la file',
-            'leave': '🚪 quitter après la file',
-            'leave_now': '🏃 quitter immédiatement',
-        }
-        return labels.get(action.get('command'), 'contrôle')
-    return str(a_type)
+    lines = []
+    for node in flat:
+        depth = int(node.get("depth", 0))
+        prefix = "-" * (depth + 1)
+        link = " *(ou)*" if node.get("link") == "or" else ""
 
+        if node.get("kind") == "if":
+            conditions = node.get("conditions") or []
+            label = "🤔 SI " + (describe_condition(conditions[0]) if conditions else "?")
+        else:
+            label = describe_action(node.get("action") or {})
 
-def describe_trigger(trigger_type: str, trigger_data: dict) -> str:
-    """
-    Décrit un déclencheur de routine en une ligne lisible.
+        lines.append(f"{prefix} {label}{link}")
 
-    Args:
-        trigger_type: Type du déclencheur (timer, schedule, event)
-        trigger_data: Données associées
-
-    Returns:
-        Description courte, préfixée d'un émoji
-    """
-    if trigger_type == 'timer':
-        low = trigger_data.get('interval_min')
-        high = trigger_data.get('interval_max')
-        if low is not None and high is not None:
-            return f"⏰ Timer aléatoire ({format_duration(low)}-{format_duration(high)})"
-        seconds = trigger_data.get('interval_seconds', 0)
-        if not seconds:
-            seconds = trigger_data.get('interval_minutes', 0) * 60
-        return f"⏰ Timer ({format_duration(seconds)})"
-
-    if trigger_type == 'schedule':
-        days = trigger_data.get('days') or []
-        day_names = ["lun", "mar", "mer", "jeu", "ven", "sam", "dim"]
-        when = ",".join(day_names[d] for d in days) if days else "tous les jours"
-        return f"🕐 À {trigger_data.get('time')} ({when})"
-
-    event = trigger_data.get('event', '?')
-    if event == 'voice_count_reached':
-        return f"👥 {trigger_data.get('count', '?')} membres dans le salon"
-    if event == 'voice_first_join':
-        return "🥇 Premier arrivé dans un salon vide"
-    if event == 'message':
-        return f"💬 Message contenant « {trigger_data.get('keyword', '')} »"
-    if event == 'reaction':
-        return f"⭐ Réaction {trigger_data.get('emoji', '')}"
-    return f"⚡ {event.replace('voice_', '')}"
+    text = "\n".join(lines)
+    return text if len(text) <= limit else text[:limit - 10] + "\n…"
 
 
 # === Instance du bot ===
@@ -464,7 +452,7 @@ HELP_SECTIONS = {
             ("🎵 Sons & lecture", "Jouer, mettre en file, ajouter et lister les sons.", True),
             ("⚙️ Administration", "Limites, volume, salons ignorés, maintenance.", True),
             ("👑 Propriétaire", "Sons globaux et remise à zéro du bot.", True),
-            ("🤖 Routines", "Créer et gérer les automatisations.", True),
+            ("🤖 Routines", "Déclencheurs multiples et trame par blocs.", True),
             ("📝 Syntaxe", "Écrire une routine en une ligne de texte.", True),
             ("💡 Exemples", "Des routines prêtes à copier.", True),
         ],
@@ -487,7 +475,8 @@ HELP_SECTIONS = {
                 "Consulter",
                 "`/queue` — file d'attente, avec le salon cible de chaque son\n"
                 "`/list_sounds` — tous les sons disponibles\n"
-                "`/stats [limite]` — classement des sons les plus joués",
+                "`/stats [limite]` — classement des sons les plus joués, "
+                "routines comprises",
                 False
             ),
             (
@@ -582,7 +571,8 @@ HELP_SECTIONS = {
         "fields": [
             (
                 "Créer",
-                "`/routine_create` — assistant interactif avec boutons\n"
+                "`/routine_create` — assistant interactif ; la sauvegarde "
+                "ne ferme pas le panel, l'embed passe au vert\n"
                 "`/routine_cmd <nom> <commande>` — création en une ligne "
                 "*(voir la section Syntaxe)*",
                 False
@@ -596,11 +586,26 @@ HELP_SECTIONS = {
                 False
             ),
             (
+                "Le principe (2.0)",
+                "Une routine = plusieurs **déclencheurs** (n'importe lequel "
+                "suffit) et une **trame** : une suite de blocs indentés, "
+                "à la manière de Scratch.\n"
+                "Un bloc **condition** ne s'exécute que si elle est vraie, et "
+                "tout ce qui est indenté dessous lui appartient.",
+                False
+            ),
+            (
                 "Dans l'assistant",
-                "Trois sections : **Triggers**, **Conditions**, **Actions**. "
-                "Les boutons du bas permettent de passer de l'une à l'autre "
-                "et de sauvegarder depuis n'importe où.\n"
-                "Une routine a besoin d'au moins un déclencheur et une action.",
+                "**⚡ Déclencheurs** : un menu déroulant liste tous les "
+                "événements possibles.\n"
+                "Membres, salons et rôles se choisissent dans une liste ; "
+                "plus besoin de copier un identifiant.\n"
+                "Les déclencheurs *mot-clé* et *réaction* peuvent être "
+                "limités à certains salons.\n"
+                "**🧩 Ajouter** : deux menus, un pour les conditions, un pour "
+                "les actions. Le bloc choisi se pose au bout de la trame.\n"
+                "**🧵 Organiser** : déplacer, imbriquer (`➡️`), sortir (`⬅️`), "
+                "et `🔀 ET/OU` pour le « sinon si ».",
                 False
             ),
         ],
@@ -609,7 +614,10 @@ HELP_SECTIONS = {
         "label": "Syntaxe : déclencheurs",
         "emoji": "📝",
         "title": "📝 Syntaxe — déclencheurs",
-        "description": "**`<déclencheur> [if <conditions>] do <actions>`**",
+        "description": (
+            "**`<déclencheur> [or <déclencheur>…] [if <conditions>] do <actions>`**\n"
+            "Plusieurs déclencheurs séparés par `or` : n'importe lequel lance la trame."
+        ),
         "fields": [
             (
                 "⏰ Temps",
@@ -633,6 +641,8 @@ HELP_SECTIONS = {
                 "💬 Texte",
                 "`on message <mot-clé>` — un message contient ce mot\n"
                 "`on reaction <émoji>` — quelqu'un ajoute cette réaction\n"
+                "*Dans le panel, ces deux déclencheurs peuvent être limités "
+                "à un ou plusieurs salons.*\n"
                 "*Le mot-clé nécessite l'intent « Message Content ».*",
                 False
             ),
@@ -645,31 +655,13 @@ HELP_SECTIONS = {
         "description": "Conditions liées par `and`, actions enchaînées par `then`.",
         "fields": [
             (
-                "🤔 Conditions *(optionnelles)*",
-                "`user=ID` · `channel=ID` · `role=ID` — listes possibles : `user=1,2`\n"
-                "`time=18:00-23:00` · `date=01/12-25/12` · `day=lun,ven`\n"
-                "`count>=3` — membres dans le salon (`>` `<` `>=` `<=`)\n"
-                "`chance=30` — ne se déclenche que 30% du temps\n"
-                "`playing=false` — seulement si rien n'est en cours",
+                "🤔 Conditions *(optionnelles, imbriquées en ET)*",
+                condition_syntax_help(),
                 False
             ),
             (
                 "🎬 Actions",
-                "`play <son>` — le son est ajouté à la file\n"
-                "`wait 1m20s` · `wait 10s-2m` — pause, fixe ou aléatoire\n"
-                "`chance 25%` — interrompt la routine si le tirage échoue\n"
-                "`volume 150` · `volume reset` — plafonné par `/config`\n"
-                "`msg <texte>` · `dm <texte>` — `{user}` et `{username}` "
-                "sont remplacés",
-                False
-            ),
-            (
-                "🎛️ Contrôle de lecture",
-                "`stop` — coupe le son et vide la file\n"
-                "`skip` · `clear`\n"
-                "`leave` — quitte **après** la fin de la file\n"
-                "`leave_now` — quitte immédiatement\n"
-                "`move <id_salon>` · `move member <id_salon>`",
+                action_syntax_help(),
                 False
             ),
         ],
@@ -694,6 +686,7 @@ HELP_SECTIONS = {
                 "```\n"
                 "on join if chance=25 do play rare\n"
                 "on join if playing=false do play bienvenue\n"
+                "on join or on leave do play bruit\n"
                 "on join if day=sam,dim and time=20:00-23:59 do play soiree\n"
                 "on join if user=123456789 do play theme_perso\n```",
                 False
@@ -968,11 +961,9 @@ async def play(
         file_path,
         interaction.user.display_name,
         sound_name,
-        target_channel
+        target_channel,
+        owner_guild_id=sound_data['guild_id']
     )
-    
-    # Incrémenter le compteur de lecture
-    await db.increment_play_count(sound_data['guild_id'], sound_name)
     
     # Message de confirmation : position == 1 signifie "premier de la file",
     # pas "en cours de lecture" (un autre son peut déjà être joué).
@@ -1698,13 +1689,13 @@ async def routine_list(interaction: discord.Interaction) -> None:
     for r in routines:
         status = "✅" if r['active'] else "❌"
         
-        # Description du trigger
-        trigger_desc = describe_trigger(r['trigger_type'], r['trigger_data'])
+        triggers = (r['trigger_data'] or {}).get('triggers', [])
+        trigger_desc = "\n".join(
+            describe_trigger(t.get('type'), t.get('data', {})) for t in triggers
+        ) or "*Aucun déclencheur*"
         
-        # Nombre d'actions
-        actions_count = len(r['actions'])
-        
-        desc = f"{trigger_desc}\n📋 {actions_count} action(s)"
+        blocks = r['actions'] or []
+        desc = f"{trigger_desc}\n🧵 {len(blocks)} bloc(s)"
         
         embed.add_field(
             name=f"{status} {r['name']} (ID: {r['id']})",
@@ -1988,11 +1979,9 @@ class SoundSelectorView(discord.ui.View):
             file_path,
             self.user.display_name,
             sound_name,
-            self.target_channel
+            self.target_channel,
+            owner_guild_id=sound_data['guild_id']
         )
-        
-        # Increment play count
-        await self.db.increment_play_count(sound_data['guild_id'], sound_name)
         
         # Update embed with last played sound and keep the view
         embed = self.build_embed(last_played=sound_name)
@@ -2333,39 +2322,23 @@ class RoutinePanelView(discord.ui.View):
                 embed = discord.Embed(title=f"Routine : {selected_routine['name']}", color=discord.Color.blue())
                 embed.add_field(name="État", value=status, inline=True)
                 
-                # Trigger
-                t_type = selected_routine['trigger_type']
-                t_data = selected_routine['trigger_data']
+                # Déclencheurs (n'importe lequel lance la trame)
+                triggers = (selected_routine['trigger_data'] or {}).get('triggers', [])
                 embed.add_field(
-                    name="Trigger",
-                    value=describe_trigger(t_type, t_data),
-                    inline=True
+                    name=f"⚡ Déclencheurs ({len(triggers)})",
+                    value="\n".join(
+                        f"• {describe_trigger(t.get('type'), t.get('data', {}))}"
+                        for t in triggers
+                    ) or "*Aucun*",
+                    inline=False
                 )
-                
-                # Conditions
-                conds = selected_routine.get('conditions')
-                if conds:
-                    c_desc = ""
-                    if conds.get('type') in ['AND', 'OR']:
-                        c_desc = f"Logique: {conds['type']}\n"
-                        for sub in conds.get('sub', []):
-                            c_desc += f"- {sub['type']} {sub['op']} {sub['value']}\n"
-                    else:
-                        c_desc = f"- {conds['type']} {conds['op']} {conds['value']}"
-                    embed.add_field(name="Conditions", value=c_desc, inline=False)
-                else:
-                    embed.add_field(name="Conditions", value="Aucune", inline=False)
 
-                # Actions
-                actions_desc = ""
-                for i, a in enumerate(selected_routine['actions']):
-                    if a['type'] == 'play_sound': val = f"🎵 Joue {a['sound_name']}"
-                    elif a['type'] == 'wait': val = f"💤 Pause {a['delay']}s"
-                    elif a['type'] == 'message': val = f"💬 Msg: {a['content']}"
-                    else: val = a['type']
-                    actions_desc += f"{i+1}. {val}\n"
-                
-                embed.add_field(name="Actions", value=actions_desc or "Aucune", inline=False)
+                # Trame
+                embed.add_field(
+                    name="🧵 Trame",
+                    value=render_flat_trame(selected_routine['actions'] or []),
+                    inline=False
+                )
                 
             else:
                 toggle_btn.disabled = True
@@ -2822,73 +2795,547 @@ async def owner_manage(interaction: discord.Interaction):
     await view.refresh_view(interaction)
 
 class RoutineCreationView(discord.ui.View):
+    """
+    Éditeur de routine par blocs.
+
+    Le principe : on fabrique des **blocs** (conditions et actions) dans une
+    bibliothèque, puis on les place dans la **trame**, qui est la suite
+    ordonnée et indentée réellement exécutée.
+
+    La trame est stockée à plat, chaque entrée portant sa profondeur. C'est
+    ce qui permet de monter, descendre et indenter un bloc par de simples
+    opérations de liste ; le moteur reconstruit l'imbrication à l'exécution.
+    """
+
+    MAX_DEPTH = 5
+
     def __init__(self, bot, db, guild_id, routine_data=None, routine_id=None):
         super().__init__(timeout=600)
         self.bot = bot
         self.db = db
         self.guild_id = guild_id
         self.routine_id = routine_id
-        
-        # Sound pagination state
+
+        # Pagination du sélecteur de sons
         self.sound_page = 0
-        self.sounds_per_page = 24  # 24 + 1 pour le bouton "Plus"
-        self.all_sounds = []  # Cache des sons disponibles
-        
-        # Data State
+        self.sounds_per_page = 24
+        self.all_sounds = []
+
+        # Données de la routine
+        self.triggers = []      # [{"type": ..., "data": {...}}]
+        self.blocks = []        # [{"id": n, "kind": "if"|"action", ...}]
+        self.trame = []         # [{"block_id": n, "depth": d, "link": "and"|"or"}]
+        self._next_block_id = 1
+
         if routine_data:
             self.name = routine_data['name']
-            self.triggers = [{"type": routine_data['trigger_type'], "data": routine_data['trigger_data']}]
-            self.actions = routine_data['actions']
-            
-            # Parse conditions
-            self.conditions = []
-            self.condition_logic = "AND"
-            self.advanced_logic_expr = None  # Expression logique avancée
-            if routine_data['conditions']:
-                c = routine_data['conditions']
-                if c.get('type') in ['AND', 'OR', 'XOR']:
-                    self.condition_logic = c['type']
-                    self.conditions = c.get('sub', [])
-                elif c.get('type') == 'EXPR':
-                    # Advanced expression mode
-                    self.advanced_logic_expr = c.get('expr', '')
-                    self.conditions = c.get('conditions', [])
-                else:
-                    self.conditions = [c]
+            self.triggers = list((routine_data.get('trigger_data') or {}).get('triggers', []))
+            self._load_trame(routine_data.get('actions') or [])
         else:
             self.name = "Nouvelle Routine"
-            self.triggers = [] 
-            self.conditions = [] 
-            self.actions = [] 
-            self.condition_logic = "AND"
-            self.advanced_logic_expr = None  # Expression logique avancée (ex: "(C1 ET C2) OU C3")
-        
-        # UI State
-        self.mode = "main" 
-        self.selected_index = None 
-        
+
+        # État de l'interface
+        self.mode = "main"
+        self.selected_index = None
+        self.pages = {}    # page courante de chaque menu déroulant
+        self.picker = None  # sélection en cours (membre, salon, rôle)
+        self.saved = False  # la routine est-elle enregistrée en l'état ?
         self.update_components()
+
+    # ------------------------------------------------------------------
+    # Chargement et sauvegarde
+    # ------------------------------------------------------------------
+
+    def _load_trame(self, flat: list) -> None:
+        """
+        Reconstruit bibliothèque et trame à partir de la liste enregistrée.
+
+        Args:
+            flat: Trame telle que stockée en base
+        """
+        for entry in flat:
+            kind = entry.get('kind', 'action')
+            block = {"id": self._next_block_id, "kind": kind}
+
+            if kind == 'if':
+                block["conditions"] = entry.get('conditions', [])
+            else:
+                block["action"] = entry.get('action', {})
+
+            self.blocks.append(block)
+            self.trame.append({
+                "block_id": block["id"],
+                "depth": int(entry.get('depth', 0)),
+                "link": entry.get('link', 'and'),
+            })
+            self._next_block_id += 1
+
+        # Une trame enregistrée avant ce contrôle peut être incohérente
+        fixed = self.normalize_depths()
+        if fixed:
+            logger.warning(
+                f"Routine « {self.name} » : {fixed} bloc(s) mal imbriqué(s) "
+                "ont été réalignés au chargement."
+            )
+
+    def build_flat_trame(self) -> list:
+        """
+        Produit la trame à enregistrer, blocs résolus.
+
+        Returns:
+            Liste de blocs à plat, prête pour la base
+        """
+        self.normalize_depths()
+
+        flat = []
+        for entry in self.trame:
+            block = self.get_block(entry["block_id"])
+            if block is None:
+                continue
+
+            node = {
+                "depth": entry.get("depth", 0),
+                "link": entry.get("link", "and"),
+                "kind": block["kind"],
+            }
+            if block["kind"] == "if":
+                node["logic"] = "AND"
+                node["conditions"] = block.get("conditions", [])
+            else:
+                node["action"] = block.get("action", {})
+            flat.append(node)
+        return flat
+
+    # ------------------------------------------------------------------
+    # Manipulation des blocs
+    # ------------------------------------------------------------------
+
+    def get_block(self, block_id: int):
+        """Retrouve un bloc par son identifiant."""
+        return next((b for b in self.blocks if b["id"] == block_id), None)
+
+    def _new_block(self, block: dict) -> dict:
+        """Enregistre un nouveau bloc dans la bibliothèque."""
+        block["id"] = self._next_block_id
+        self._next_block_id += 1
+        self.blocks.append(block)
+        return block
+
+    def add_action_block(self, action: dict) -> dict:
+        """
+        Crée un bloc action et le place à la fin de la trame.
+
+        Args:
+            action: Données de l'action
+
+        Returns:
+            Le bloc créé
+        """
+        block = self._new_block({"kind": "action", "action": action})
+        self._append_to_trame(block["id"])
+        return block
+
+    def add_condition_block(self, condition: dict) -> dict:
+        """
+        Crée un bloc condition et le place à la fin de la trame.
+
+        Un bloc ne porte qu'une condition : combiner plusieurs conditions se
+        fait en imbriquant les blocs (ET) ou en les chaînant en OU.
+
+        Args:
+            condition: Condition feuille
+
+        Returns:
+            Le bloc créé
+        """
+        block = self._new_block({"kind": "if", "conditions": [condition]})
+        self._append_to_trame(block["id"])
+        return block
+
+    def _append_to_trame(self, block_id: int) -> None:
+        """
+        Ajoute un bloc à la fin de la trame.
+
+        Le nouveau bloc hérite du niveau du précédent, et descend d'un cran
+        si celui-ci est un bloc conditionnel : c'est presque toujours ce
+        qu'on veut après avoir posé une condition.
+        """
+        depth = 0
+        if self.trame:
+            last = self.trame[-1]
+            last_block = self.get_block(last["block_id"])
+            depth = last["depth"]
+            if last_block and last_block["kind"] == "if":
+                depth = min(self.MAX_DEPTH, depth + 1)
+
+        self.trame.append({"block_id": block_id, "depth": depth, "link": "and"})
+        self.selected_index = len(self.trame) - 1
+        self.saved = False
+
+    def delete_trame_entry(self, index: int) -> None:
+        """
+        Retire une entrée de la trame, avec tout ce qu'elle contient.
+
+        Args:
+            index: Position dans la trame
+        """
+        if not 0 <= index < len(self.trame):
+            return
+
+        end = self._group_end(index)
+        removed = self.trame[index:end]
+        del self.trame[index:end]
+
+        # Les blocs qui ne sont plus placés retournent... nulle part :
+        # la bibliothèque ne garde que ce qui est utilisé.
+        used = {e["block_id"] for e in self.trame}
+        for entry in removed:
+            if entry["block_id"] not in used:
+                self.blocks = [b for b in self.blocks if b["id"] != entry["block_id"]]
+
+        # Retirer une condition peut laisser ses voisins trop indentés
+        self.normalize_depths()
+        self.selected_index = None
+        self.saved = False
+
+    def move_entry(self, index: int, direction: int) -> None:
+        """
+        Déplace un bloc et son contenu vers le haut ou vers le bas.
+
+        Args:
+            index: Position du bloc
+            direction: -1 pour monter, +1 pour descendre
+        """
+        if not 0 <= index < len(self.trame):
+            return
+
+        depth = self.trame[index]["depth"]
+        end = self._group_end(index)
+        group = self.trame[index:end]
+
+        if direction < 0:
+            # Chercher le frère précédent de même niveau
+            prev = index - 1
+            while prev >= 0 and self.trame[prev]["depth"] > depth:
+                prev -= 1
+            if prev < 0 or self.trame[prev]["depth"] < depth:
+                return
+            del self.trame[index:end]
+            self.trame[prev:prev] = group
+            self.selected_index = prev
+            self.normalize_depths()
+            self.saved = False
+        else:
+            if end >= len(self.trame) or self.trame[end]["depth"] < depth:
+                return
+            # Fin du groupe suivant
+            nxt = end + 1
+            while nxt < len(self.trame) and self.trame[nxt]["depth"] > self.trame[end]["depth"]:
+                nxt += 1
+            block_after = self.trame[end:nxt]
+            del self.trame[index:nxt]
+            self.trame[index:index] = block_after + group
+            self.selected_index = index + len(block_after)
+            self.normalize_depths()
+            self.saved = False
+
+    def indent_entry(self, index: int) -> str:
+        """
+        Place un bloc à l'intérieur de la condition qui le précède.
+
+        L'imbrication n'a de sens que sous une condition : le frère
+        précédent au même niveau doit être un bloc conditionnel.
+
+        Args:
+            index: Position du bloc
+
+        Returns:
+            Un message d'erreur, ou une chaîne vide si l'opération a réussi
+        """
+        if not 0 <= index < len(self.trame):
+            return "Aucun bloc sélectionné."
+
+        entry = self.trame[index]
+        depth = entry["depth"]
+
+        if depth >= self.MAX_DEPTH:
+            return f"Profondeur maximale atteinte ({self.MAX_DEPTH} niveaux)."
+
+        # Frère précédent : le dernier bloc de même niveau avant celui-ci,
+        # en sautant tout ce qui est imbriqué plus profond.
+        sibling = None
+        for i in range(index - 1, -1, -1):
+            if self.trame[i]["depth"] < depth:
+                break
+            if self.trame[i]["depth"] == depth:
+                sibling = self.trame[i]
+                break
+
+        if sibling is None:
+            return "Aucun bloc au-dessus dans lequel imbriquer celui-ci."
+
+        sibling_block = self.get_block(sibling["block_id"])
+        if not sibling_block or sibling_block["kind"] != "if":
+            return (
+                "Seule une condition peut contenir d'autres blocs. "
+                "Placez d'abord une condition juste au-dessus."
+            )
+
+        end = self._group_end(index)
+        for e in self.trame[index:end]:
+            e["depth"] += 1
+        self.saved = False
+        return ""
+
+    def outdent_entry(self, index: int) -> str:
+        """
+        Sort un bloc de la condition qui le contient.
+
+        Le bloc est déplacé *après* les frères qui le suivaient dans la
+        condition : sans cela, ces frères se retrouveraient rattachés à lui
+        et l'affichage annoncerait une imbrication que le moteur ignore.
+
+        Args:
+            index: Position du bloc
+
+        Returns:
+            Un message d'erreur, ou une chaîne vide si l'opération a réussi
+        """
+        if not 0 <= index < len(self.trame):
+            return "Aucun bloc sélectionné."
+
+        entry = self.trame[index]
+        depth = entry["depth"]
+        if depth == 0:
+            return "Ce bloc est déjà au niveau le plus à gauche."
+
+        end = self._group_end(index)
+        group = self.trame[index:end]
+
+        # Fin de la condition qui le contenait : tout ce qui suit et reste
+        # plus profond appartient encore à cette condition.
+        after = end
+        while after < len(self.trame) and self.trame[after]["depth"] >= depth:
+            after += 1
+
+        for e in group:
+            e["depth"] -= 1
+
+        del self.trame[index:end]
+        insert_at = after - len(group)
+        self.trame[insert_at:insert_at] = group
+        self.selected_index = insert_at
+        self.saved = False
+        return ""
+
+    def _group_end(self, index: int) -> int:
+        """
+        Retourne l'index de fin du bloc et de tout son contenu.
+
+        Args:
+            index: Position du bloc
+
+        Returns:
+            Index juste après le dernier descendant
+        """
+        depth = self.trame[index]["depth"]
+        end = index + 1
+        while end < len(self.trame) and self.trame[end]["depth"] > depth:
+            end += 1
+        return end
+
+    def normalize_depths(self) -> int:
+        """
+        Répare les profondeurs incohérentes de la trame.
+
+        Un bloc ne peut être imbriqué que d'un niveau sous le précédent, et
+        seulement si celui-ci est une condition. Toute autre profondeur est
+        ramenée au maximum autorisé : l'affichage reflète alors exactement
+        ce que le moteur exécutera.
+
+        Returns:
+            Nombre de blocs corrigés
+        """
+        fixed = 0
+        allowed = 0   # profondeur maximale pour le bloc courant
+
+        for entry in self.trame:
+            depth = max(0, min(int(entry.get("depth", 0)), allowed, self.MAX_DEPTH))
+            if depth != entry.get("depth"):
+                entry["depth"] = depth
+                fixed += 1
+
+            block = self.get_block(entry["block_id"])
+            # Seule une condition ouvre un niveau supplémentaire
+            allowed = depth + 1 if (block and block["kind"] == "if") else depth
+
+        return fixed
+
+    def toggle_link(self, index: int) -> str:
+        """
+        Bascule un bloc entre enchaînement « et » et « ou ».
+
+        Args:
+            index: Position du bloc
+
+        Returns:
+            Un message d'erreur, ou une chaîne vide
+        """
+        if not 0 <= index < len(self.trame):
+            return "Aucun bloc sélectionné."
+
+        entry = self.trame[index]
+        if index == 0:
+            return "Le premier bloc n'a rien à quoi se chaîner."
+
+        # Le « ou » n'a de sens qu'entre deux frères de même niveau
+        previous = self.trame[index - 1]
+        if previous["depth"] != entry["depth"]:
+            sibling = None
+            for e in reversed(self.trame[:index]):
+                if e["depth"] == entry["depth"]:
+                    sibling = e
+                    break
+            if sibling is None:
+                return "Aucun bloc frère avant celui-ci."
+
+        entry["link"] = "or" if entry.get("link", "and") == "and" else "and"
+        self.saved = False
+        return ""
+
+    # ------------------------------------------------------------------
+    # Rendu
+    # ------------------------------------------------------------------
+
+    def format_block(self, block: dict) -> str:
+        """Décrit un bloc en une ligne."""
+        if block is None:
+            return "*bloc manquant*"
+        if block["kind"] == "if":
+            conditions = block.get("conditions", [])
+            return "🤔 SI " + (describe_condition(conditions[0]) if conditions else "?")
+        return describe_action(block.get("action", {}))
+
+    def render_trame(self, marker: bool = True) -> str:
+        """
+        Rend la trame sous forme de liste indentée.
+
+        Args:
+            marker: Afficher le curseur sur le bloc sélectionné
+
+        Returns:
+            Le texte prêt pour l'embed
+        """
+        if not self.trame:
+            return "*Trame vide — créez un bloc pour commencer.*"
+
+        lines = []
+        for i, entry in enumerate(self.trame):
+            block = self.get_block(entry["block_id"])
+            prefix = "-" * (entry["depth"] + 1)
+            link = " *(ou)*" if entry.get("link") == "or" else ""
+            cursor = "▸ " if (marker and i == self.selected_index) else ""
+            lines.append(f"`{i + 1:2}.` {cursor}{prefix} {self.format_block(block)}{link}")
+
+        text = "\n".join(lines)
+        return text if len(text) <= 1000 else text[:990] + "\n…"
+
+    def format_trigger(self, t):
+        """Décrit un déclencheur du panel."""
+        return describe_trigger(t.get('type'), t.get('data', {}))
+
+    # Un menu déroulant Discord accepte 25 options ; on en réserve deux
+    # pour la navigation dès qu'il y a plusieurs pages.
+    MENU_PAGE_SIZE = 23
+
+    PAGE_PREV = "__page_prev__"
+    PAGE_NEXT = "__page_next__"
+
+    def _paginate(self, items: list, key: str):
+        """
+        Découpe une liste pour l'afficher dans un menu déroulant.
+
+        Args:
+            items: Éléments à afficher
+            key: Nom de la liste, pour mémoriser la page courante
+
+        Returns:
+            Tuple (éléments de la page, index de la page, nombre de pages)
+        """
+        total_pages = max(1, (len(items) - 1) // self.MENU_PAGE_SIZE + 1)
+        page = max(0, min(self.pages.get(key, 0), total_pages - 1))
+        self.pages[key] = page
+
+        start = page * self.MENU_PAGE_SIZE
+        return items[start:start + self.MENU_PAGE_SIZE], page, total_pages
+
+    def _page_options(self, page: int, total_pages: int) -> list:
+        """
+        Construit les options de navigation d'un menu paginé.
+
+        Elles vivent dans le menu lui-même : les lignes du panel sont trop
+        rares pour y consacrer des boutons.
+
+        Args:
+            page: Page courante
+            total_pages: Nombre total de pages
+
+        Returns:
+            Liste d'options à ajouter à la fin du menu
+        """
+        if total_pages <= 1:
+            return []
+
+        options = []
+        if page > 0:
+            options.append(discord.SelectOption(
+                label=f"◀️ Page précédente ({page}/{total_pages})",
+                value=self.PAGE_PREV,
+                description="Revenir en arrière dans la liste"
+            ))
+        if page < total_pages - 1:
+            options.append(discord.SelectOption(
+                label=f"▶️ Page suivante ({page + 2}/{total_pages})",
+                value=self.PAGE_NEXT,
+                description="Voir la suite de la liste"
+            ))
+        return options
+
+    def _handle_page_change(self, key: str, value: str) -> bool:
+        """
+        Traite la sélection d'une option de navigation.
+
+        Args:
+            key: Nom de la liste concernée
+            value: Valeur sélectionnée
+
+        Returns:
+            True s'il s'agissait d'un changement de page
+        """
+        if value == self.PAGE_PREV:
+            self.pages[key] = max(0, self.pages.get(key, 0) - 1)
+            return True
+        if value == self.PAGE_NEXT:
+            self.pages[key] = self.pages.get(key, 0) + 1
+            return True
+        return False
 
     def _add_nav_bar(self, row: int) -> None:
         """
-        Ajoute la barre de navigation d'un sous-menu.
-
-        Permet de passer directement d'une section à l'autre et de
-        sauvegarder sans repasser par le menu principal.
+        Barre commune : retour, sections voisines et sauvegarde.
 
         Args:
-            row: Ligne où placer la barre (doit être la dernière occupée)
+            row: Ligne où placer la barre
         """
         self.add_item(discord.ui.Button(
             label="Retour", style=discord.ButtonStyle.secondary,
             custom_id="back", row=row
         ))
 
-        # Les deux autres sections, celle en cours exclue
         sections = [
-            ("menu_triggers", "Triggers", "⚡", "triggers"),
-            ("menu_conditions", "Conditions", "🤔", "conditions"),
-            ("menu_actions", "Actions", "🎬", "actions"),
+            ("menu_triggers", "Déclencheurs", "⚡", "triggers"),
+            ("menu_blocks", "Ajouter", "🧩", "blocks"),
+            ("menu_trame", "Organiser", "🧵", "trame"),
         ]
         for custom_id, label, emoji, mode in sections:
             if mode == self.mode:
@@ -2898,582 +3345,593 @@ class RoutineCreationView(discord.ui.View):
                 custom_id=custom_id, emoji=emoji, row=row
             ))
 
-        # Sauvegarde accessible depuis n'importe quelle section
         self.add_item(discord.ui.Button(
             label="Sauvegarder", style=discord.ButtonStyle.success,
             custom_id="save", emoji="💾", row=row,
-            disabled=(not self.triggers or not self.actions)
+            disabled=(not self.triggers or not self.trame)
         ))
 
     def update_components(self):
+        """Reconstruit les composants selon la section courante."""
         self.clear_items()
-        
+
         if self.mode == "main":
-            # Main Dashboard
-            self.add_item(discord.ui.Button(label="Modifier Nom", style=discord.ButtonStyle.secondary, custom_id="edit_name", emoji="✏️", row=0))
-            self.add_item(discord.ui.Button(label=f"Triggers ({len(self.triggers)})", style=discord.ButtonStyle.primary, custom_id="menu_triggers", emoji="⚡", row=1))
-            self.add_item(discord.ui.Button(label=f"Conditions ({len(self.conditions)})", style=discord.ButtonStyle.primary, custom_id="menu_conditions", emoji="🤔", row=1))
-            self.add_item(discord.ui.Button(label=f"Actions ({len(self.actions)})", style=discord.ButtonStyle.primary, custom_id="menu_actions", emoji="🎬", row=1))
-            
-            self.add_item(discord.ui.Button(label="Sauvegarder", style=discord.ButtonStyle.success, custom_id="save", emoji="💾", row=2, disabled=(len(self.triggers)==0 or len(self.actions)==0)))
-            self.add_item(discord.ui.Button(label="Annuler", style=discord.ButtonStyle.danger, custom_id="cancel", row=2))
+            self.add_item(discord.ui.Button(label="Renommer", style=discord.ButtonStyle.secondary, custom_id="set_name", emoji="✏️", row=0))
+            self.add_item(discord.ui.Button(label="Déclencheurs", style=discord.ButtonStyle.primary, custom_id="menu_triggers", emoji="⚡", row=0))
+            self.add_item(discord.ui.Button(label="Ajouter un bloc", style=discord.ButtonStyle.primary, custom_id="menu_blocks", emoji="🧩", row=0))
+            self.add_item(discord.ui.Button(label="Organiser", style=discord.ButtonStyle.primary, custom_id="menu_trame", emoji="🧵", row=0))
+
+            self.add_item(discord.ui.Button(
+                label="Enregistré" if self.saved else "Sauvegarder",
+                style=discord.ButtonStyle.success,
+                custom_id="save", emoji="💾", row=1,
+                disabled=(self.saved or not self.triggers or not self.trame)
+            ))
+            self.add_item(discord.ui.Button(
+                label="Fermer", style=discord.ButtonStyle.secondary,
+                custom_id="close", emoji="✖️", row=1
+            ))
+            if not self.saved:
+                self.add_item(discord.ui.Button(
+                    label="Abandonner", style=discord.ButtonStyle.danger,
+                    custom_id="cancel", row=1
+                ))
 
         elif self.mode == "triggers":
-            # Trigger Management
-            # Les 5 boutons tiennent sur une seule ligne. La row 4 doit
-            # rester libre : le menu déroulant "Event" s'y insère.
-            self.add_item(discord.ui.Button(label="Timer", style=discord.ButtonStyle.success, custom_id="add_timer", emoji="⏰", row=0))
-            self.add_item(discord.ui.Button(label="Heure", style=discord.ButtonStyle.success, custom_id="add_schedule", emoji="🕐", row=0))
-            self.add_item(discord.ui.Button(label="Event", style=discord.ButtonStyle.success, custom_id="add_event", emoji="📥", row=0))
-            self.add_item(discord.ui.Button(label="Membres", style=discord.ButtonStyle.success, custom_id="add_count", emoji="👥", row=0))
-            self.add_item(discord.ui.Button(label="Mot-clé", style=discord.ButtonStyle.success, custom_id="add_keyword", emoji="💬", row=0))
-            
-            # Selection for deletion/move
+            # Chaque déclencheur du catalogue a sa propre entrée : plus de
+            # bouton « Event » qui ouvre un second menu.
+            page_items, page, total = self._paginate(TRIGGER_MENU, "trigger_menu")
+            options = [
+                discord.SelectOption(
+                    label=t.label[:100],
+                    value=t.key,
+                    emoji=t.emoji,
+                    description=t.hint[:100] or None
+                )
+                for t in page_items
+            ] + self._page_options(page, total)
+
+            self.add_item(discord.ui.Select(
+                placeholder="➕ Ajouter un déclencheur…",
+                custom_id="menu_add_trigger", options=options, row=0
+            ))
+
             if self.triggers:
-                options = []
-                for i, t in enumerate(self.triggers):
-                    label = f"{i+1}. {self.format_trigger(t)}"
-                    options.append(discord.SelectOption(label=label[:100], value=str(i)))
-                
-                self.add_item(discord.ui.Select(placeholder="Sélectionner un trigger", custom_id="select_item", options=options, row=1))
-                
-                self.add_item(discord.ui.Button(label="Supprimer", style=discord.ButtonStyle.danger, custom_id="delete_item", row=2))
-            
-            # row 4 reste libre pour le menu déroulant "Event"
+                items, page, total = self._paginate(
+                    list(enumerate(self.triggers)), "triggers_list"
+                )
+                options = [
+                    discord.SelectOption(
+                        label=f"{i + 1}. {self.format_trigger(t)}"[:100],
+                        value=str(i),
+                        description="Sélectionner pour pouvoir le retirer"[:100],
+                        default=(i == self.selected_index)
+                    )
+                    for i, t in items
+                ] + self._page_options(page, total)
+
+                self.add_item(discord.ui.Select(
+                    placeholder="🗑️ Déclencheurs déjà ajoutés…",
+                    custom_id="select_item", options=options, row=1
+                ))
+                self.add_item(discord.ui.Button(
+                    label="Retirer celui-ci", style=discord.ButtonStyle.danger,
+                    custom_id="delete_item", emoji="🗑️", row=2,
+                    disabled=self.selected_index is None
+                ))
+
             self._add_nav_bar(row=3)
 
-        elif self.mode == "conditions":
-            # Condition Management
-            self.add_item(discord.ui.Button(label="Ajouter Condition", style=discord.ButtonStyle.success, custom_id="add_condition", emoji="➕", row=0))
-            
-            # Logic Toggle (simple mode) - cycles through AND -> OR -> XOR
-            # Disabled when advanced logic is set
-            logic_labels = {
-                "AND": "Logique: TOUT (ET)",
-                "OR": "Logique: AU MOINS 1 (OU)",
-                "XOR": "Logique: UN SEUL (XOR)"
-            }
-            label = logic_labels.get(self.condition_logic, "Logique: ET")
-            toggle_disabled = bool(self.advanced_logic_expr)
-            self.add_item(discord.ui.Button(label=label, style=discord.ButtonStyle.primary, custom_id="toggle_logic", row=0, disabled=toggle_disabled))
-            
-            # Advanced Logic Button - always shown, disabled if < 2 conditions
-            if self.advanced_logic_expr:
-                # Show reset button when advanced mode is active
-                self.add_item(discord.ui.Button(label="Réinitialiser", style=discord.ButtonStyle.danger, custom_id="reset_advanced_logic", emoji="🔄", row=0))
+        elif self.mode == "blocks":
+            # Deux menus séparés : les conditions d'un côté, les actions de
+            # l'autre. Chaque type a son entrée, avec sa propre explication.
+            page_items, page, total = self._paginate(
+                list(CONDITION_BLOCKS.values()), "condition_menu"
+            )
+            options = [
+                discord.SelectOption(
+                    label=(b.label or b.type)[:100],
+                    value=b.type,
+                    emoji=b.emoji,
+                    description=b.hint[:100] or None
+                )
+                for b in page_items
+            ] + self._page_options(page, total)
+
+            self.add_item(discord.ui.Select(
+                placeholder="🤔 Ajouter une condition…",
+                custom_id="menu_add_condition", options=options, row=0
+            ))
+
+            page_items, page, total = self._paginate(ACTION_MENU, "action_menu")
+            options = [
+                discord.SelectOption(
+                    label=entry.label[:100],
+                    value=entry.key,
+                    emoji=entry.emoji,
+                    description=entry.hint[:100] or None
+                )
+                for entry in page_items
+            ] + self._page_options(page, total)
+
+            self.add_item(discord.ui.Select(
+                placeholder="🎬 Ajouter une action…",
+                custom_id="menu_add_action", options=options, row=1
+            ))
+
+            self._add_nav_bar(row=3)
+
+        elif self.mode == "picker":
+            spec = self.picker or {}
+            kind = spec.get("component")
+
+            if kind == "user":
+                self.add_item(discord.ui.UserSelect(
+                    placeholder="Choisir un ou plusieurs membres…",
+                    custom_id="picker_select",
+                    min_values=1, max_values=spec.get("max_values", 1), row=0
+                ))
+            elif kind == "role":
+                self.add_item(discord.ui.RoleSelect(
+                    placeholder="Choisir un ou plusieurs rôles…",
+                    custom_id="picker_select",
+                    min_values=1, max_values=spec.get("max_values", 1), row=0
+                ))
             else:
-                adv_disabled = len(self.conditions) < 2
-                self.add_item(discord.ui.Button(label="Logique Avancée", style=discord.ButtonStyle.secondary, custom_id="advanced_logic", emoji="🧮", row=0, disabled=adv_disabled))
+                self.add_item(discord.ui.ChannelSelect(
+                    placeholder="Choisir un salon…",
+                    custom_id="picker_select",
+                    channel_types=spec.get("channel_types") or [
+                        discord.ChannelType.voice, discord.ChannelType.stage_voice
+                    ],
+                    min_values=1, max_values=spec.get("max_values", 1), row=0
+                ))
 
-            if self.conditions:
+            # Options propres au bloc en cours de construction
+            if spec.get("ops") and len(spec["ops"]) > 1:
+                negated = spec.get("op") == "!="
+                self.add_item(discord.ui.Button(
+                    label="Ne doit PAS correspondre" if negated else "Doit correspondre",
+                    style=discord.ButtonStyle.danger if negated else discord.ButtonStyle.success,
+                    custom_id="picker_toggle_op", emoji="🔁", row=1
+                ))
+
+            if spec.get("purpose") == "move":
+                is_member = spec.get("target") == "member"
+                self.add_item(discord.ui.Button(
+                    label="Déplacer le membre" if is_member else "Déplacer le bot",
+                    style=discord.ButtonStyle.primary,
+                    custom_id="picker_toggle_target", emoji="🔁", row=1
+                ))
+
+            if spec.get("purpose") == "message":
+                self.add_item(discord.ui.Button(
+                    label="Salon du déclencheur", style=discord.ButtonStyle.secondary,
+                    custom_id="picker_default_channel", emoji="📍", row=1
+                ))
+
+            if spec.get("purpose") == "trigger_channels":
+                self.add_item(discord.ui.Button(
+                    label="Partout sur le serveur", style=discord.ButtonStyle.primary,
+                    custom_id="picker_default_channel", emoji="🌍", row=1
+                ))
+
+            if spec.get("purpose") != "trigger_channels":
+                self.add_item(discord.ui.Button(
+                    label="Saisir un ID à la place", style=discord.ButtonStyle.secondary,
+                    custom_id="picker_manual", emoji="⌨️", row=2
+                ))
+            self.add_item(discord.ui.Button(
+                label="Annuler", style=discord.ButtonStyle.danger,
+                custom_id="picker_cancel", row=2
+            ))
+
+        elif self.mode == "trame":
+            self.add_item(discord.ui.Button(label="Monter", style=discord.ButtonStyle.secondary, custom_id="move_up", emoji="⬆️", row=0))
+            self.add_item(discord.ui.Button(label="Descendre", style=discord.ButtonStyle.secondary, custom_id="move_down", emoji="⬇️", row=0))
+            self.add_item(discord.ui.Button(label="Imbriquer", style=discord.ButtonStyle.secondary, custom_id="indent", emoji="➡️", row=0))
+            self.add_item(discord.ui.Button(label="Sortir", style=discord.ButtonStyle.secondary, custom_id="outdent", emoji="⬅️", row=0))
+            self.add_item(discord.ui.Button(label="ET / OU", style=discord.ButtonStyle.secondary, custom_id="toggle_link", emoji="🔀", row=0))
+
+            if self.trame:
+                items, page, total = self._paginate(
+                    list(enumerate(self.trame)), "trame_list"
+                )
                 options = []
-                for i, c in enumerate(self.conditions):
-                    label = f"C{i+1}. {self.format_condition(c)}"
-                    options.append(discord.SelectOption(label=label[:100], value=str(i)))
-                
-                self.add_item(discord.ui.Select(placeholder="Sélectionner une condition", custom_id="select_item", options=options, row=1))
-                
-                self.add_item(discord.ui.Button(label="Monter", style=discord.ButtonStyle.secondary, custom_id="move_up", row=2))
-                self.add_item(discord.ui.Button(label="Descendre", style=discord.ButtonStyle.secondary, custom_id="move_down", row=2))
-                self.add_item(discord.ui.Button(label="Supprimer", style=discord.ButtonStyle.danger, custom_id="delete_item", row=2))
+                for i, entry in items:
+                    block = self.get_block(entry["block_id"])
+                    label = ("· " * entry["depth"]) + self.format_block(block)
+                    description = f"Niveau {entry['depth'] + 1}"
+                    if entry.get("link") == "or":
+                        description += " · sinon-si"
+                    options.append(discord.SelectOption(
+                        label=label[:100],
+                        value=str(i),
+                        description=description[:100],
+                        default=(i == self.selected_index)
+                    ))
+                options += self._page_options(page, total)
+
+                self.add_item(discord.ui.Select(
+                    placeholder="✏️ Choisir un bloc à déplacer ou supprimer…",
+                    custom_id="select_item", options=options, row=1
+                ))
+                self.add_item(discord.ui.Button(
+                    label="Supprimer ce bloc", style=discord.ButtonStyle.danger,
+                    custom_id="delete_item", emoji="🗑️", row=2,
+                    disabled=self.selected_index is None
+                ))
 
             self._add_nav_bar(row=3)
 
-        elif self.mode == "actions":
-            # Action Management
-            self.add_item(discord.ui.Button(label="Son", style=discord.ButtonStyle.success, custom_id="add_action_sound", emoji="🎵", row=0))
-            self.add_item(discord.ui.Button(label="Pause", style=discord.ButtonStyle.success, custom_id="add_action_wait", emoji="💤", row=0))
-            self.add_item(discord.ui.Button(label="Message", style=discord.ButtonStyle.success, custom_id="add_action_msg", emoji="💬", row=0))
-            self.add_item(discord.ui.Button(label="Chance", style=discord.ButtonStyle.success, custom_id="add_action_chance", emoji="🎲", row=0))
-            self.add_item(discord.ui.Button(label="Volume", style=discord.ButtonStyle.success, custom_id="add_action_volume", emoji="🔊", row=0))
-            
-            # Contrôles de lecture : des boutons directs plutôt qu'un menu
-            # déroulant, qui n'aurait plus de ligne libre où s'insérer.
-            self.add_item(discord.ui.Button(label="Stop", style=discord.ButtonStyle.primary, custom_id="act_stop", emoji="⏹️", row=1))
-            self.add_item(discord.ui.Button(label="Skip", style=discord.ButtonStyle.primary, custom_id="act_skip", emoji="⏭️", row=1))
-            self.add_item(discord.ui.Button(label="Vider", style=discord.ButtonStyle.primary, custom_id="act_clear", emoji="🧹", row=1))
-            self.add_item(discord.ui.Button(label="Quitter", style=discord.ButtonStyle.primary, custom_id="act_leave", emoji="🚪", row=1))
-            self.add_item(discord.ui.Button(label="Déplacer", style=discord.ButtonStyle.primary, custom_id="add_action_move", emoji="↔️", row=1))
-
-            if self.actions:
-                options = []
-                for i, a in enumerate(self.actions):
-                    label = f"{i+1}. {self.format_action(a)}"
-                    options.append(discord.SelectOption(label=label[:100], value=str(i)))
-                
-                self.add_item(discord.ui.Select(placeholder="Sélectionner une action", custom_id="select_item", options=options, row=2))
-                
-                self.add_item(discord.ui.Button(label="Monter", style=discord.ButtonStyle.secondary, custom_id="move_up", row=3))
-                self.add_item(discord.ui.Button(label="Descendre", style=discord.ButtonStyle.secondary, custom_id="move_down", row=3))
-                self.add_item(discord.ui.Button(label="Supprimer", style=discord.ButtonStyle.danger, custom_id="delete_item", row=3))
-
-            self._add_nav_bar(row=4)
-
-    def format_trigger(self, t):
-        """Décrit un trigger du panel (même rendu que /routine_list)."""
-        return describe_trigger(t.get('type'), t.get('data', {}))
-
-    def format_condition(self, c):
-        return f"{c['type']} {c['op']} {c['value']}"
-
-    def format_action(self, a):
-        """Décrit une action du panel (même rendu qu'ailleurs)."""
-        return describe_action(a)
+    # ------------------------------------------------------------------
+    # Interactions
+    # ------------------------------------------------------------------
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.type == discord.InteractionType.component:
-            cid = interaction.data.get("custom_id")
-            
-            # Navigation
-            if cid == "back":
-                # If we're in sound selector, go back to actions mode
-                if self.all_sounds:
-                    self.mode = "actions"
-                    self.sound_page = 0
-                    self.all_sounds = []
-                else:
-                    self.mode = "main"
-                self.selected_index = None
-            elif cid == "menu_triggers": self.mode = "triggers"
-            elif cid == "menu_conditions": self.mode = "conditions"
-            elif cid == "menu_actions": self.mode = "actions"
-            elif cid == "cancel":
-                await interaction.response.edit_message(content="❌ Création annulée.", embed=None, view=None)
-                return False
-            
-            # Main Actions
-            elif cid == "edit_name":
-                await interaction.response.send_modal(NameInputModal(self))
-                return False
-            elif cid == "save":
-                await self.save_routine(interaction)
-                return False
+        """Route les clics et les sélections du panel."""
+        cid = interaction.data.get("custom_id")
+        values = interaction.data.get("values") or []
+        value = values[0] if values else None
+        notice = ""
 
-            # Trigger Actions
-            elif cid == "add_timer":
-                await interaction.response.send_modal(TimeInputModal(self))
-                return False
-            elif cid == "add_schedule":
-                await interaction.response.send_modal(ScheduleInputModal(self))
-                return False
-            elif cid == "add_count":
-                await interaction.response.send_modal(CountInputModal(self))
-                return False
-            elif cid == "add_keyword":
-                await interaction.response.send_modal(KeywordInputModal(self))
-                return False
-            elif cid == "add_event":
-                # Quick select for event
-                self.add_item(discord.ui.Select(placeholder="Choisir l'événement", custom_id="quick_select_event", row=4, options=[
-                    discord.SelectOption(label="🥇 Premier arrivé", value="voice_first_join", description="Le premier humain dans un salon vide"),
-                    discord.SelectOption(label="🟢 Join Vocal", value="voice_join", description="Quand quelqu'un rejoint un salon"),
-                    discord.SelectOption(label="🔴 Leave Vocal", value="voice_leave", description="Quand quelqu'un quitte un salon"),
-                    discord.SelectOption(label="🔀 Move Vocal", value="voice_move", description="Quand quelqu'un change de salon"),
-                    discord.SelectOption(label="🔇 Mute", value="voice_mute", description="Quand quelqu'un coupe son micro"),
-                    discord.SelectOption(label="🔊 Unmute", value="voice_unmute", description="Quand quelqu'un active son micro"),
-                    discord.SelectOption(label="🚫 Deafen", value="voice_deafen", description="Quand quelqu'un coupe son casque"),
-                    discord.SelectOption(label="🎧 Undeafen", value="voice_undeafen", description="Quand quelqu'un active son casque"),
-                    discord.SelectOption(label="📺 Stream Start", value="voice_stream_start", description="Quand quelqu'un lance un stream"),
-                    discord.SelectOption(label="📵 Stream Stop", value="voice_stream_stop", description="Quand quelqu'un arrête son stream"),
-                    discord.SelectOption(label="📹 Vidéo Start", value="voice_video_start", description="Quand quelqu'un active sa caméra"),
-                    discord.SelectOption(label="📷 Vidéo Stop", value="voice_video_stop", description="Quand quelqu'un désactive sa caméra")
-                ]))
-                await interaction.response.edit_message(view=self) # Update to show select
-                return False
-            
-            # Condition Actions
-            elif cid == "add_condition":
-                await interaction.response.send_modal(ConditionInputModal(self))
-                return False
-            elif cid == "toggle_logic":
-                # Cycle through AND -> OR -> XOR -> AND (only works when not in advanced mode)
-                if not self.advanced_logic_expr:
-                    if self.condition_logic == "AND":
-                        self.condition_logic = "OR"
-                    elif self.condition_logic == "OR":
-                        self.condition_logic = "XOR"
-                    else:
-                        self.condition_logic = "AND"
-            elif cid == "advanced_logic":
-                await self.show_advanced_logic_panel(interaction)
-                return False
-            elif cid == "reset_advanced_logic":
-                # Reset to simple mode with AND as default
-                self.advanced_logic_expr = None
-                self.condition_logic = "AND"
-
-            # Action Actions
-            elif cid == "add_action_sound":
-                # Show paginated sound selector
-                sounds = await self.db.get_available_sounds(self.guild_id)
-                self.all_sounds = sorted(sounds.keys())
-                self.sound_page = 0
-                await self._show_sound_selector(interaction)
-                return False
-            elif cid == "sound_page_prev":
-                # Page précédente des sons
-                self.sound_page = max(0, self.sound_page - 1)
-                await self._show_sound_selector(interaction)
-                return False
-            elif cid == "sound_page_next":
-                # Page suivante des sons
-                max_pages = (len(self.all_sounds) - 1) // self.sounds_per_page
-                self.sound_page = min(max_pages, self.sound_page + 1)
-                await self._show_sound_selector(interaction)
-                return False
-            elif cid == "add_action_wait":
-                await interaction.response.send_modal(WaitInputModal(self))
-                return False
-            elif cid == "add_action_msg":
-                await interaction.response.send_modal(MessageInputModal(self))
-                return False
-            elif cid == "add_action_chance":
-                await interaction.response.send_modal(ChanceInputModal(self))
-                return False
-            elif cid == "add_action_volume":
-                # Le plafond du serveur est lu ici: la modale n'a pas accès
-                # à la base une fois ouverte.
-                ceiling = await self.bot.player_manager.get_player(
-                    self.guild_id
-                ).get_max_volume()
-                await interaction.response.send_modal(VolumeInputModal(self, ceiling))
-                return False
-            elif cid == "add_action_move":
-                await interaction.response.send_modal(MoveInputModal(self))
-                return False
-            elif cid == "act_leave":
-                # Deux comportements possibles : la modale tranche
-                await interaction.response.send_modal(LeaveInputModal(self))
-                return False
-            elif cid in ("act_stop", "act_skip", "act_clear"):
-                self.actions.append({
-                    "type": "player_control",
-                    "command": cid.removeprefix("act_")
-                })
-
-            # List Management (Select)
-            elif cid == "select_item":
-                self.selected_index = int(interaction.data["values"][0])
-            
-            # List Management (Buttons)
-            elif cid == "delete_item" and self.selected_index is not None:
-                if self.mode == "triggers": self.triggers.pop(self.selected_index)
-                elif self.mode == "conditions": self.conditions.pop(self.selected_index)
-                elif self.mode == "actions": self.actions.pop(self.selected_index)
-                self.selected_index = None
-            
-            elif cid == "move_up" and self.selected_index is not None and self.selected_index > 0:
-                lst = self.conditions if self.mode == "conditions" else self.actions
-                lst[self.selected_index], lst[self.selected_index-1] = lst[self.selected_index-1], lst[self.selected_index]
-                self.selected_index -= 1
-            
-            elif cid == "move_down" and self.selected_index is not None:
-                lst = self.conditions if self.mode == "conditions" else self.actions
-                if self.selected_index < len(lst) - 1:
-                    lst[self.selected_index], lst[self.selected_index+1] = lst[self.selected_index+1], lst[self.selected_index]
-                    self.selected_index += 1
-
-            # Quick Select Handlers
-            elif cid == "quick_select_event":
-                val = interaction.data["values"][0]
-                self.triggers.append({"type": "event", "data": {"event": val}})
-                # Remove the select by updating components
-            elif cid == "quick_select_sound":
-                val = interaction.data["values"][0]
-                if val != "none":
-                    # For random, store special marker that routine_manager will handle
-                    if val == "__random__":
-                        self.actions.append({"type": "play_sound", "sound_name": "__random__", "target_strategy": "active"})
-                    else:
-                        self.actions.append({"type": "play_sound", "sound_name": val, "target_strategy": "active"})
-                # Reset sound pagination state and return to actions menu
-                self.sound_page = 0
+        # --- Navigation entre sections ---
+        if cid == "back":
+            if self.all_sounds:
                 self.all_sounds = []
-                self.mode = "actions"
+                self.mode = "blocks"
+            else:
+                self.mode = "main"
+            self.selected_index = None
+        elif cid == "menu_triggers":
+            self.mode = "triggers"
+            self.selected_index = None
+        elif cid == "menu_blocks":
+            self.mode = "blocks"
+            self.selected_index = None
+        elif cid == "menu_trame":
+            self.mode = "trame"
+            self.selected_index = None
+        elif cid == "cancel":
+            self.stop()
+            message = (
+                "❌ Modifications abandonnées." if self.routine_id
+                else "❌ Création abandonnée."
+            )
+            await interaction.response.edit_message(
+                content=message, embed=None, view=None
+            )
+            return False
+        elif cid == "close":
+            self.stop()
+            embed = discord.Embed(
+                title=f"{'✅' if self.saved else '📕'} {self.name}",
+                description=(
+                    "Routine enregistrée. Rouvrez-la avec `/routine_manage`."
+                    if self.saved else
+                    "Panel fermé **sans enregistrer**."
+                ),
+                color=discord.Color.green() if self.saved else discord.Color.greyple()
+            )
+            await interaction.response.edit_message(embed=embed, view=None)
+            return False
+        elif cid == "save":
+            await self.save_routine(interaction)
+            return False
+        elif cid == "set_name":
+            await interaction.response.send_modal(NameInputModal(self))
+            return False
 
-            self.update_components()
-            await self.refresh_embed(interaction)
+        # --- Menu : ajouter un déclencheur ---
+        elif cid == "menu_add_trigger":
+            if not self._handle_page_change("trigger_menu", value):
+                entry = trigger_by_key(value)
+                if entry is None:
+                    notice = "Ce déclencheur n'existe plus."
+                elif entry.modal:
+                    opened = await self._open_form(interaction, entry.modal, entry.label)
+                    if opened:
+                        return False
+                    notice = "Ce déclencheur est mal configuré, voir les logs."
+                elif entry.trigger:
+                    self.triggers.append(copy.deepcopy(entry.trigger))
+                    self.saved = False
+
+        # --- Menu : ajouter une condition ---
+        elif cid == "menu_add_condition":
+            if not self._handle_page_change("condition_menu", value):
+                block = CONDITION_BLOCKS.get(value)
+                if block is None:
+                    notice = "Cette condition n'existe plus."
+                elif block.picker:
+                    # Sélection native : pas d'identifiant à recopier
+                    self.picker = {
+                        "component": block.picker,
+                        "purpose": "condition",
+                        "block_type": block.type,
+                        "op": block.default_op,
+                        "ops": block.ops,
+                        "max_values": 5,
+                    }
+                    self.mode = "picker"
+                else:
+                    await interaction.response.send_modal(
+                        ConditionFormModal(self, block)
+                    )
+                    return False
+
+        # --- Menu : ajouter une action ---
+        elif cid == "menu_add_action":
+            if not self._handle_page_change("action_menu", value):
+                entry = next((e for e in ACTION_MENU if e.key == value), None)
+
+                if entry is None:
+                    notice = "Cette action n'existe plus."
+                elif entry.special == "sound":
+                    await self._show_sound_selector(interaction)
+                    return False
+                elif entry.special == "move":
+                    self.picker = {
+                        "component": "channel",
+                        "purpose": "move",
+                        "target": "bot",
+                    }
+                    self.mode = "picker"
+                elif entry.modal:
+                    opened = await self._open_form(interaction, entry.modal, entry.label)
+                    if opened:
+                        return False
+                    notice = "Cette action est mal configurée, voir les logs."
+                elif entry.payload:
+                    self.add_action_block(copy.deepcopy(entry.payload))
+                    self.mode = "trame"
+
+        # --- Sélection native de membre, salon ou rôle ---
+        elif cid == "picker_select":
+            ids = ",".join(str(v) for v in values)
+            notice = self._apply_picker(ids)
+
+        elif cid == "picker_toggle_op":
+            spec = self.picker or {}
+            spec["op"] = "!=" if spec.get("op") == "==" else "=="
+
+        elif cid == "picker_toggle_target":
+            spec = self.picker or {}
+            spec["target"] = "bot" if spec.get("target") == "member" else "member"
+
+        elif cid == "picker_default_channel":
+            notice = self._apply_picker(None)
+
+        elif cid == "picker_manual":
+            block_type = (self.picker or {}).get("block_type")
+            block = CONDITION_BLOCKS.get(block_type)
+            if block is not None:
+                await interaction.response.send_modal(ConditionFormModal(self, block))
+                self.picker = None
+                self.mode = "trame"
+                return False
+            await interaction.response.send_modal(ManualIdModal(self))
+            return False
+
+        elif cid == "picker_cancel":
+            purpose = (self.picker or {}).get("purpose")
+            self.picker = None
+            self.mode = "triggers" if purpose == "trigger_channels" else "blocks"
+
+        # --- Sélecteur de sons ---
+        elif cid == "quick_select_sound":
+            if value and value != "none":
+                self.add_action_block({
+                    "type": "play_sound",
+                    "sound_name": value,
+                    "target_strategy": "active"
+                })
+            self.all_sounds = []
+            self.mode = "trame"
+
+        elif cid in ("sound_page_prev", "sound_page_next"):
+            self.sound_page += -1 if cid == "sound_page_prev" else 1
+            await self._show_sound_selector(interaction)
+            return False
+
+        # --- Sélection dans une liste existante ---
+        elif cid == "select_item":
+            list_key = "triggers_list" if self.mode == "triggers" else "trame_list"
+            if not self._handle_page_change(list_key, value):
+                self.selected_index = int(value)
+
+        elif cid == "delete_item":
+            if self.selected_index is None:
+                notice = "Choisissez d'abord un élément dans la liste."
+            elif self.mode == "triggers":
+                if self.selected_index < len(self.triggers):
+                    self.triggers.pop(self.selected_index)
+                self.selected_index = None
+                self.saved = False
+            else:
+                self.delete_trame_entry(self.selected_index)
+
+        # --- Réorganisation de la trame ---
+        elif cid in ("move_up", "move_down"):
+            if self.selected_index is None:
+                notice = "Choisissez d'abord un bloc dans la liste."
+            else:
+                self.move_entry(self.selected_index, -1 if cid == "move_up" else 1)
+
+        elif cid == "indent":
+            notice = (
+                "Choisissez d'abord un bloc dans la liste."
+                if self.selected_index is None
+                else self.indent_entry(self.selected_index)
+            )
+
+        elif cid == "outdent":
+            notice = (
+                "Choisissez d'abord un bloc dans la liste."
+                if self.selected_index is None
+                else self.outdent_entry(self.selected_index)
+            )
+
+        elif cid == "toggle_link":
+            notice = (
+                "Choisissez d'abord un bloc dans la liste."
+                if self.selected_index is None
+                else self.toggle_link(self.selected_index)
+            )
+
+        self.update_components()
+        await self.refresh_embed(interaction, notice)
+        return False
+
+    def _apply_picker(self, ids) -> str:
+        """
+        Construit le bloc à partir de la sélection native.
+
+        Args:
+            ids: Identifiants choisis, séparés par des virgules, ou None
+                pour « salon du déclencheur »
+
+        Returns:
+            Un message d'avertissement, ou une chaîne vide
+        """
+        spec = self.picker or {}
+        purpose = spec.get("purpose")
+
+        if purpose == "condition":
+            self.add_condition_block({
+                "type": spec["block_type"],
+                "value": ids,
+                "op": spec.get("op", "=="),
+            })
+
+        elif purpose == "message":
+            self.add_action_block({
+                "type": "message",
+                "content": spec.get("content", ""),
+                "channel_id": (ids or "").split(",")[0] or None,
+            })
+
+        elif purpose == "trigger_channels":
+            data = dict(spec.get("trigger") or {})
+            if ids:
+                data["channels"] = ids.split(",")
+            self.triggers.append({"type": "event", "data": data})
+            self.saved = False
+            self.picker = None
+            self.mode = "triggers"
+            return ""
+
+        elif purpose == "move":
+            if not ids:
+                return "Choisissez un salon de destination."
+            self.add_action_block({
+                "type": "move",
+                "target": spec.get("target", "bot"),
+                "channel_id": ids.split(",")[0],
+            })
+
+        else:
+            return "Sélection sans destination, annulée."
+
+        self.picker = None
+        self.mode = "trame"
+        return ""
+
+    async def _open_form(
+        self,
+        interaction: discord.Interaction,
+        modal_name: str,
+        label: str
+    ) -> bool:
+        """
+        Ouvre le formulaire déclaré par une entrée de catalogue.
+
+        Args:
+            interaction: Interaction en cours
+            modal_name: Nom de la classe de formulaire
+            label: Libellé de l'entrée, pour le message d'erreur
+
+        Returns:
+            True si le formulaire a bien été ouvert
+        """
+        modal_cls = globals().get(modal_name)
+        if modal_cls is None:
+            logger.error(
+                f"« {label} » déclare le formulaire '{modal_name}', "
+                "qui n'existe pas dans bot.py."
+            )
+            return False
+
+        # Le plafond de volume dépend du serveur : il est lu avant l'ouverture
+        if modal_name == "VolumeInputModal":
+            ceiling = await self.bot.player_manager.get_player(
+                self.guild_id
+            ).get_max_volume()
+            await interaction.response.send_modal(modal_cls(self, ceiling))
+        else:
+            await interaction.response.send_modal(modal_cls(self))
         return True
 
-    async def show_advanced_logic_panel(self, interaction: discord.Interaction):
-        """Affiche le panel de logique avancée et attend un message de l'utilisateur."""
-        # Build conditions list with diminutives
-        cond_list = ""
-        for i, c in enumerate(self.conditions):
-            cond_list += f"  **C{i+1}** : {self.format_condition(c)}\n"
-        
-        embed = discord.Embed(
-            title="🧮 Mode Conditions Avancées",
-            color=discord.Color.purple()
-        )
-        
-        embed.add_field(
-            name="📋 Vos conditions",
-            value=cond_list or "*Aucune condition*",
-            inline=False
-        )
-        
-        embed.add_field(
-            name="📝 Connecteurs logiques",
-            value=(
-                "• **ET** / **AND** : Les deux doivent être vraies\n"
-                "• **OU** / **OR** : Au moins une doit être vraie\n"
-                "• **XOR** : Exactement une seule vraie\n"
-                "• **NON** / **NOT** : Inverse la condition\n"
-                "• **( )** : Définir les priorités"
-            ),
-            inline=False
-        )
-        
-        embed.add_field(
-            name="💡 Exemples",
-            value=(
-                "`(C1 ET C2) OU C3`\n"
-                "→ Si (user ET time), OU si role\n\n"
-                "`C1 ET (C2 OU C3)`\n"
-                "→ Si user ET (time OU role)\n\n"
-                "`NON C1 ET C2`\n"
-                "→ Si PAS user ET time\n\n"
-                "`C1 XOR C2`\n"
-                "→ Si user OU time mais pas les deux"
-            ),
-            inline=False
-        )
-        
-        current_expr = self.advanced_logic_expr or f"C1 ET C2 ET ... (défaut: {self.condition_logic})"
-        embed.add_field(
-            name="⚙️ Expression actuelle",
-            value=f"`{current_expr}`",
-            inline=False
-        )
-        
-        embed.set_footer(text="⌨️ Envoyez votre expression dans le chat (ou 'annuler' pour revenir)...")
-        
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-        
-        # Wait for user message
-        def check(m):
-            return m.author.id == interaction.user.id and m.channel.id == interaction.channel_id
-        
-        try:
-            msg = await self.bot.wait_for('message', timeout=120.0, check=check)
-            
-            # Try to delete the user's message
-            try:
-                await msg.delete()
-            except:
-                pass
-            
-            if msg.content.lower() == 'annuler':
-                await interaction.followup.send("❌ Annulé. Retour au mode simple.", ephemeral=True)
-                return
-            
-            # Parse the expression
-            try:
-                parsed = self.parse_logic_expression(msg.content)
-                self.advanced_logic_expr = msg.content.upper()
-                await interaction.followup.send(f"✅ Expression logique enregistrée : `{self.advanced_logic_expr}`", ephemeral=True)
-            except ValueError as e:
-                await interaction.followup.send(f"❌ Erreur de syntaxe : {e}", ephemeral=True)
-                
-        except asyncio.TimeoutError:
-            await interaction.followup.send("⏰ Temps écoulé. Aucune modification.", ephemeral=True)
-
-    def parse_logic_expression(self, expr: str) -> dict:
-        """
-        Parse une expression logique avec parenthèses et retourne un arbre de conditions.
-        Exemple: "(C1 ET C2) OU C3" -> {"type": "OR", "sub": [{"type": "AND", "sub": [C1, C2]}, C3]}
-        """
-        # Normalize expression
-        expr = expr.upper().strip()
-        expr = expr.replace("AND", " ET ").replace("OR", " OU ").replace("NOT", " NON ")
-        expr = " ".join(expr.split())  # Normalize whitespace
-        
-        # Tokenize
-        tokens = self._tokenize(expr)
-        
-        # Parse with operator precedence: NOT > AND/ET > XOR > OR/OU
-        result, pos = self._parse_or(tokens, 0)
-        
-        if pos < len(tokens):
-            raise ValueError(f"Token inattendu : {tokens[pos]}")
-        
-        return result
-    
-    def _tokenize(self, expr: str) -> list:
-        """Tokenize l'expression en liste de tokens."""
-        tokens = []
-        i = 0
-        while i < len(expr):
-            if expr[i] in '()':
-                tokens.append(expr[i])
-                i += 1
-            elif expr[i] == ' ':
-                i += 1
-            else:
-                # Read word
-                j = i
-                while j < len(expr) and expr[j] not in '() ':
-                    j += 1
-                word = expr[i:j]
-                tokens.append(word)
-                i = j
-        return tokens
-    
-    def _parse_or(self, tokens: list, pos: int) -> tuple:
-        """Parse OR/OU expressions (lowest precedence)."""
-        left, pos = self._parse_xor(tokens, pos)
-        
-        while pos < len(tokens) and tokens[pos] == 'OU':
-            pos += 1  # Skip 'OU'
-            right, pos = self._parse_xor(tokens, pos)
-            left = {"type": "OR", "sub": [left, right]}
-        
-        return left, pos
-    
-    def _parse_xor(self, tokens: list, pos: int) -> tuple:
-        """Parse XOR expressions."""
-        left, pos = self._parse_and(tokens, pos)
-        
-        while pos < len(tokens) and tokens[pos] == 'XOR':
-            pos += 1  # Skip 'XOR'
-            right, pos = self._parse_and(tokens, pos)
-            left = {"type": "XOR", "sub": [left, right]}
-        
-        return left, pos
-    
-    def _parse_and(self, tokens: list, pos: int) -> tuple:
-        """Parse AND/ET expressions."""
-        left, pos = self._parse_not(tokens, pos)
-        
-        while pos < len(tokens) and tokens[pos] == 'ET':
-            pos += 1  # Skip 'ET'
-            right, pos = self._parse_not(tokens, pos)
-            left = {"type": "AND", "sub": [left, right]}
-        
-        return left, pos
-    
-    def _parse_not(self, tokens: list, pos: int) -> tuple:
-        """Parse NOT/NON expressions."""
-        if pos < len(tokens) and tokens[pos] == 'NON':
-            pos += 1  # Skip 'NON'
-            operand, pos = self._parse_not(tokens, pos)  # NOT is right-associative
-            return {"type": "NOT", "sub": [operand]}, pos
-        
-        return self._parse_primary(tokens, pos)
-    
-    def _parse_primary(self, tokens: list, pos: int) -> tuple:
-        """Parse primary expressions (conditions or parenthesized expressions)."""
-        if pos >= len(tokens):
-            raise ValueError("Expression incomplète")
-        
-        token = tokens[pos]
-        
-        if token == '(':
-            pos += 1  # Skip '('
-            result, pos = self._parse_or(tokens, pos)
-            if pos >= len(tokens) or tokens[pos] != ')':
-                raise ValueError("Parenthèse fermante ')' manquante")
-            pos += 1  # Skip ')'
-            return result, pos
-        
-        elif token.startswith('C') and token[1:].isdigit():
-            # Condition reference like C1, C2, etc.
-            idx = int(token[1:]) - 1  # C1 -> index 0
-            if idx < 0 or idx >= len(self.conditions):
-                raise ValueError(f"Condition {token} n'existe pas (max: C{len(self.conditions)})")
-            return self.conditions[idx], pos + 1
-        
-        else:
-            raise ValueError(f"Token invalide : '{token}'. Utilisez C1, C2, etc.")
-
-    def build_condition_tree_from_expr(self) -> dict:
-        """Construit l'arbre de conditions à partir de l'expression avancée ou du mode simple."""
-        if self.advanced_logic_expr:
-            return self.parse_logic_expression(self.advanced_logic_expr)
-        elif len(self.conditions) == 1:
-            return self.conditions[0]
-        elif len(self.conditions) > 1:
-            return {"type": self.condition_logic, "sub": self.conditions}
-        return None
+    # ------------------------------------------------------------------
+    # Sélecteur de sons
+    # ------------------------------------------------------------------
 
     async def _show_sound_selector(self, interaction: discord.Interaction):
-        """
-        Affiche le sélecteur de sons paginé.
-
-        Ne démonte la vue qu'une fois certain de pouvoir la reconstruire :
-        une exception après clear_items() laisserait un message dont tous
-        les boutons pointent vers une vue vide ("unknown view").
-        """
-        # Aucun son : inutile d'afficher un menu vide, on le signale et on
-        # reste sur le menu des actions.
+        """Affiche le sélecteur de sons paginé."""
         if not self.all_sounds:
-            self.mode = "actions"
+            sounds = await self.db.get_available_sounds(str(self.guild_id))
+            self.all_sounds = sorted(sounds.keys())
+            self.sound_page = 0
+
+        if not self.all_sounds:
+            self.mode = "blocks"
             self.update_components()
             await interaction.response.send_message(
-                "🔇 Aucun son disponible sur ce serveur. Ajoutez-en avec "
-                "`/add_sound`, ou importez les fichiers existants avec `/sync`.",
+                "🔇 Aucun son disponible. Ajoutez-en avec `/add_sound`, "
+                "ou importez les fichiers existants avec `/sync`.",
                 ephemeral=True
             )
             return
 
-        # Pagination
         total_pages = (len(self.all_sounds) - 1) // self.sounds_per_page + 1
         self.sound_page = max(0, min(self.sound_page, total_pages - 1))
         start_idx = self.sound_page * self.sounds_per_page
         page_sounds = self.all_sounds[start_idx:start_idx + self.sounds_per_page]
 
-        # Options de la page courante ("Random" seulement sur la première)
         options = []
         if self.sound_page == 0:
             options.append(discord.SelectOption(
-                label="Random 🔥",
-                value="__random__",
-                emoji="🎲"
+                label="Random 🔥", value="__random__", emoji="🎲"
             ))
         options.extend(
             discord.SelectOption(label=name[:100], value=name[:100])
             for name in page_sounds
         )
 
-        # Tout est construit : on peut remplacer les composants
         self.clear_items()
-
         self.add_item(discord.ui.Select(
-            placeholder=f"Choisir un son (Page {self.sound_page + 1}/{total_pages})",
-            custom_id="quick_select_sound",
-            options=options,
-            row=0
+            placeholder=f"Choisir un son (page {self.sound_page + 1}/{total_pages})",
+            custom_id="quick_select_sound", options=options, row=0
         ))
 
         if total_pages > 1:
             self.add_item(discord.ui.Button(
-                label="◀️ Précédent",
-                style=discord.ButtonStyle.secondary,
-                custom_id="sound_page_prev",
-                disabled=self.sound_page == 0,
-                row=1
+                label="◀️ Précédent", style=discord.ButtonStyle.secondary,
+                custom_id="sound_page_prev", disabled=self.sound_page == 0, row=1
             ))
             self.add_item(discord.ui.Button(
                 label=f"Page {self.sound_page + 1}/{total_pages}",
                 style=discord.ButtonStyle.secondary,
-                custom_id="sound_page_info",
-                disabled=True,
-                row=1
+                custom_id="sound_page_info", disabled=True, row=1
             ))
             self.add_item(discord.ui.Button(
-                label="Suivant ▶️",
-                style=discord.ButtonStyle.secondary,
+                label="Suivant ▶️", style=discord.ButtonStyle.secondary,
                 custom_id="sound_page_next",
-                disabled=self.sound_page >= total_pages - 1,
-                row=1
+                disabled=self.sound_page >= total_pages - 1, row=1
             ))
 
         self.add_item(discord.ui.Button(
-            label="Annuler",
-            style=discord.ButtonStyle.danger,
-            custom_id="back",
-            row=2
+            label="Annuler", style=discord.ButtonStyle.danger, custom_id="back", row=2
         ))
 
         if interaction.response.is_done():
@@ -3481,25 +3939,103 @@ class RoutineCreationView(discord.ui.View):
         else:
             await interaction.response.edit_message(view=self)
 
+    # ------------------------------------------------------------------
+    # Affichage et erreurs
+    # ------------------------------------------------------------------
+
+    async def refresh_embed(self, interaction: discord.Interaction, notice: str = ""):
+        """
+        Met à jour l'embed du panel.
+
+        Args:
+            interaction: Interaction en cours
+            notice: Message d'avertissement à afficher en bas
+        """
+        embed = discord.Embed(
+            title=f"{'✅' if self.saved else '🛠️'} {self.name}",
+            color=discord.Color.green() if self.saved else discord.Color.blue()
+        )
+
+        triggers = (
+            "\n".join(f"`{i + 1}.` {self.format_trigger(t)}" for i, t in enumerate(self.triggers))
+            or "*Aucun déclencheur — la routine ne partira jamais.*"
+        )
+        embed.add_field(
+            name=f"⚡ Se déclenche quand… ({len(self.triggers)})",
+            value=triggers + (
+                "\n*N'importe lequel suffit à lancer la trame.*"
+                if len(self.triggers) > 1 else ""
+            ),
+            inline=False
+        )
+
+        embed.add_field(
+            name=f"🧵 Puis exécute ({len(self.trame)} bloc(s))",
+            value=self.render_trame(),
+            inline=False
+        )
+
+        if self.mode == "trame":
+            embed.add_field(
+                name="ℹ️ Organiser la trame",
+                value=(
+                    "Choisissez un bloc dans la liste, puis déplacez-le.\n"
+                    "**➡️ Imbriquer** le place *à l'intérieur* de la condition "
+                    "juste au-dessus : il ne s'exécutera que si elle est vraie.\n"
+                    "**🔀 ET/OU** : un bloc en *ou* n'est tenté que si le "
+                    "précédent n'a **pas** été exécuté."
+                ),
+                inline=False
+            )
+        elif self.mode == "blocks":
+            embed.add_field(
+                name="ℹ️ Ajouter un bloc",
+                value=(
+                    "Le bloc choisi se pose à la fin de la trame. S'il suit "
+                    "une condition, il est imbriqué dedans automatiquement.\n"
+                    "Utilisez **🧵 Organiser** pour le déplacer ensuite."
+                ),
+                inline=False
+            )
+        elif self.mode == "triggers":
+            embed.add_field(
+                name="ℹ️ Déclencheurs",
+                value=(
+                    "Ajoutez-en autant que vous voulez : la routine part dès "
+                    "que **l'un d'eux** se produit."
+                ),
+                inline=False
+            )
+
+        if notice:
+            embed.add_field(name="⚠️", value=notice, inline=False)
+
+        if not self.triggers or not self.trame:
+            embed.set_footer(
+                text="Il faut au moins un déclencheur et un bloc pour sauvegarder."
+            )
+        elif self.saved:
+            embed.set_footer(text="Enregistrée. Continuez à modifier si besoin.")
+        else:
+            embed.set_footer(text="Modifications non enregistrées.")
+
+        if interaction.response.is_done():
+            await interaction.edit_original_response(embed=embed, view=self)
+        else:
+            await interaction.response.edit_message(embed=embed, view=self)
+
     async def on_error(
         self,
         interaction: discord.Interaction,
         error: Exception,
         item: discord.ui.Item
     ) -> None:
-        """
-        Rattrape toute erreur d'un composant du panel.
-
-        Sans ce filet, une exception laisse la vue dans un état incohérent
-        (souvent sans composants) et tous les boutons suivants deviennent
-        inertes avec un « unknown view ».
-        """
+        """Rattrape toute erreur d'un composant et restaure un panel cohérent."""
         logger.error(
             f"Erreur dans le panel de routine (item={getattr(item, 'label', item)}): {error}",
             exc_info=error
         )
 
-        # Restaurer une vue cohérente
         try:
             self.mode = "main"
             self.selected_index = None
@@ -3510,8 +4046,8 @@ class RoutineCreationView(discord.ui.View):
             logger.exception("Restauration du panel impossible")
 
         message = (
-            "❌ Une erreur est survenue dans le panel. "
-            "Il a été réinitialisé, vos modifications en cours sont conservées."
+            "❌ Une erreur est survenue dans le panel. Il a été réinitialisé, "
+            "votre routine en cours est conservée."
         )
         try:
             if interaction.response.is_done():
@@ -3521,94 +4057,47 @@ class RoutineCreationView(discord.ui.View):
         except discord.HTTPException:
             pass
 
-    async def refresh_embed(self, interaction: discord.Interaction):
-        embed = discord.Embed(title=f"🛠️ {self.name}", color=discord.Color.blue())
-        
-        # Build Description based on state
-        desc = ""
-        
-        # Triggers
-        desc += f"**⚡ Triggers ({len(self.triggers)})**\n"
-        if not self.triggers: desc += "*Aucun déclencheur*\n"
-        for i, t in enumerate(self.triggers):
-            desc += f"`{i+1}.` {self.format_trigger(t)}\n"
-        if len(self.triggers) > 1:
-            # La base ne stocke qu'un déclencheur par routine
-            desc += "⚠️ *Seul le trigger n°1 sera enregistré.*\n"
-        
-        # Conditions - show with C1, C2, etc. for advanced mode
-        if self.advanced_logic_expr:
-            desc += f"\n**🤔 Conditions (Avancé)**\n"
-            desc += f"*Expression:* `{self.advanced_logic_expr}`\n"
-        else:
-            logic_label = {"AND": "ET", "OR": "OU", "XOR": "XOR"}.get(self.condition_logic, self.condition_logic)
-            desc += f"\n**🤔 Conditions ({logic_label})**\n"
-        
-        if not self.conditions: 
-            desc += "*Aucune condition*\n"
-        else:
-            for i, c in enumerate(self.conditions):
-                desc += f"`C{i+1}.` {self.format_condition(c)}\n"
-            
-        # Actions
-        desc += f"\n**🎬 Actions**\n"
-        if not self.actions: desc += "*Aucune action*\n"
-        for i, a in enumerate(self.actions):
-            desc += f"`{i+1}.` {self.format_action(a)}\n"
-
-        embed.description = desc
-        
-        if self.mode != "main":
-            embed.set_footer(text=f"Mode Édition: {self.mode.upper()} - Utilisez les boutons pour modifier.")
-        else:
-            embed.set_footer(text="Configurez votre routine et sauvegardez.")
-
-        if interaction.response.is_done():
-            await interaction.edit_original_response(embed=embed, view=self)
-        else:
-            await interaction.response.edit_message(embed=embed, view=self)
+    # ------------------------------------------------------------------
+    # Sauvegarde
+    # ------------------------------------------------------------------
 
     async def save_routine(self, interaction: discord.Interaction):
-        # Le bouton est désactivé dans ce cas, mais une vue restaurée après
-        # erreur pourrait le réactiver: on ne fait pas confiance à l'UI seule.
-        if not self.triggers or not self.actions:
+        """
+        Enregistre la routine sans fermer le panel.
+
+        L'embed passe au vert et l'édition reste possible : toute
+        modification ultérieure le remet au bleu et réactive la sauvegarde.
+        """
+        if not self.triggers or not self.trame:
             await interaction.response.send_message(
-                "❌ Une routine a besoin d'au moins un déclencheur et une action.",
+                "❌ Une routine a besoin d'au moins un déclencheur et un bloc.",
                 ephemeral=True
             )
             return
 
-        primary_trigger = self.triggers[0]
-        
-        # Compile conditions using advanced expression or simple mode
-        final_conditions = self.build_condition_tree_from_expr()
+        trigger_data = {"triggers": self.triggers}
+        flat = self.build_flat_trame()
 
         if self.routine_id:
             await self.db.update_routine(
-                self.routine_id,
-                self.name,
-                primary_trigger["type"],
-                primary_trigger["data"],
-                self.actions,
-                final_conditions,
-                str(self.guild_id)
+                self.routine_id, self.name, "v2", trigger_data,
+                flat, None, str(self.guild_id)
             )
-            msg = f"La routine **{self.name}** a été mise à jour."
+            notice = "Routine mise à jour."
         else:
-            await self.db.add_routine(
-                str(self.guild_id),
-                self.name,
-                primary_trigger["type"],
-                primary_trigger["data"],
-                self.actions,
-                final_conditions
+            # L'identifiant est conservé : une deuxième sauvegarde met à
+            # jour la routine au lieu d'en créer une copie.
+            self.routine_id = await self.db.add_routine(
+                str(self.guild_id), self.name, "v2", trigger_data, flat, None
             )
-            msg = f"La routine **{self.name}** a été créée."
+            notice = "Routine créée."
 
         await self.bot.routine_manager.load_routines()
-        
-        embed = discord.Embed(title="✅ Routine Sauvegardée", description=msg, color=discord.Color.green())
-        await interaction.response.edit_message(embed=embed, view=None)
+
+        self.saved = True
+        self.mode = "main"
+        self.update_components()
+        await self.refresh_embed(interaction, notice)
 
 class TimeInputModal(discord.ui.Modal, title="Ajouter Timer"):
     duration = discord.ui.TextInput(
@@ -3709,109 +4198,118 @@ class CountInputModal(discord.ui.Modal, title="Palier de membres"):
         await self.view.refresh_embed(interaction)
 
 
-class KeywordInputModal(discord.ui.Modal, title="Mot-clé ou réaction"):
-    kind = discord.ui.TextInput(label="Type (message ou reaction)", placeholder="message")
-    value = discord.ui.TextInput(label="Mot-clé ou émoji", placeholder="bonjour")
+class KeywordTriggerModal(discord.ui.Modal, title="Déclencheur : mot-clé"):
+    """Déclenche la routine quand un message contient un mot."""
+
+    keyword = discord.ui.TextInput(
+        label="Mot ou expression à repérer",
+        placeholder="bonjour",
+        max_length=100
+    )
 
     def __init__(self, view):
         super().__init__()
         self.view = view
 
     async def on_submit(self, interaction: discord.Interaction):
-        kind = self.kind.value.strip().lower()
-        value = self.value.value.strip()
-
+        value = self.keyword.value.strip()
         if not value:
-            await interaction.response.send_message("❌ Valeur manquante.", ephemeral=True)
-            return
-
-        warn_intent = False
-        
-        if kind.startswith("mess"):
-            self.view.triggers.append({
-                "type": "event",
-                "data": {"event": "message", "keyword": value}
-            })
-            warn_intent = not Config.MESSAGE_CONTENT_INTENT
-        elif kind.startswith("react"):
-            self.view.triggers.append({
-                "type": "event",
-                "data": {"event": "reaction", "emoji": value}
-            })
-        else:
             await interaction.response.send_message(
-                "❌ Type invalide. Utilisez « message » ou « reaction ».", ephemeral=True)
+                "❌ Il faut indiquer un mot-clé.", ephemeral=True)
             return
 
+        # Étape suivante : limiter à certains salons, ou non
+        self.view.picker = {
+            "component": "channel",
+            "purpose": "trigger_channels",
+            "trigger": {"event": "message", "keyword": value},
+            "channel_types": [discord.ChannelType.text, discord.ChannelType.news],
+            "max_values": 10,
+        }
+        self.view.mode = "picker"
         self.view.update_components()
         await self.view.refresh_embed(interaction)
-        
-        # Le panel est à jour : on peut prévenir en message de suivi
-        if warn_intent:
+
+        if not Config.MESSAGE_CONTENT_INTENT:
             await interaction.followup.send(
-                "⚠️ Trigger ajouté, mais l'intent « Message Content » est désactivé : "
-                "il ne se déclenchera pas tant que MESSAGE_CONTENT_INTENT=true n'est pas "
-                "défini et l'intent coché dans le portail développeur Discord.",
+                "⚠️ Déclencheur ajouté, mais l'intent « Message Content » est "
+                "désactivé : il ne se déclenchera pas tant que "
+                "MESSAGE_CONTENT_INTENT=true n'est pas défini et l'intent "
+                "coché dans le portail développeur Discord.",
                 ephemeral=True
             )
 
-class ConditionInputModal(discord.ui.Modal, title="Ajouter Condition"):
-    c_type = discord.ui.TextInput(
-        label="Type",
-        placeholder="user, channel, role, time, date, count, chance, day, playing"
-    )
-    value = discord.ui.TextInput(
-        label="Valeur",
-        placeholder="123456789 · 18:00-23:00 · 3 · 30 · lun,ven · false"
-    )
-    op = discord.ui.TextInput(
-        label="Opérateur (==, !=, >, <, >=, <=)",
-        placeholder="==",
-        required=False,
-        default="=="
-    )
 
-    VALID_TYPES = {
-        "user": "user_id",
-        "channel": "channel_id",
-        "role": "role_id",
-        "time": "time_range",
-        "date": "date_range",
-        "count": "member_count",
-        "members": "member_count",
-        "chance": "chance",
-        "day": "weekday",
-        "jour": "weekday",
-        "playing": "is_playing",
-    }
-    VALID_OPS = {"==", "!=", ">", "<", ">=", "<="}
+class ReactionTriggerModal(discord.ui.Modal, title="Déclencheur : réaction"):
+    """Déclenche la routine quand quelqu'un ajoute une réaction."""
+
+    emoji = discord.ui.TextInput(
+        label="Émoji de la réaction",
+        placeholder="🎉",
+        max_length=100
+    )
 
     def __init__(self, view):
         super().__init__()
         self.view = view
 
     async def on_submit(self, interaction: discord.Interaction):
-        t = self.c_type.value.lower().strip()
-        v = self.value.value.strip()
-        o = (self.op.value or "==").strip() or "=="
-
-        if t not in self.VALID_TYPES:
+        value = self.emoji.value.strip()
+        if not value:
             await interaction.response.send_message(
-                f"❌ Type invalide. Utilisez : {', '.join(sorted(set(self.VALID_TYPES)))}",
-                ephemeral=True
-            )
+                "❌ Il faut indiquer un émoji.", ephemeral=True)
             return
 
-        if o not in self.VALID_OPS:
-            await interaction.response.send_message(
-                f"❌ Opérateur invalide. Utilisez : {', '.join(sorted(self.VALID_OPS))}",
-                ephemeral=True
-            )
-            return
-
-        self.view.conditions.append({"type": self.VALID_TYPES[t], "value": v, "op": o})
+        self.view.picker = {
+            "component": "channel",
+            "purpose": "trigger_channels",
+            "trigger": {"event": "reaction", "emoji": value},
+            "channel_types": [
+                discord.ChannelType.text,
+                discord.ChannelType.news,
+                discord.ChannelType.voice,
+            ],
+            "max_values": 10,
+        }
+        self.view.mode = "picker"
         self.view.update_components()
         await self.view.refresh_embed(interaction)
+
+
+class ManualIdModal(discord.ui.Modal, title="Saisir un identifiant"):
+    """
+    Repli quand la sélection native ne convient pas.
+
+    Utile pour viser un salon d'un autre serveur, ou un membre absent de
+    la liste proposée par Discord.
+    """
+
+    identifiant = discord.ui.TextInput(
+        label="Identifiant",
+        placeholder="123456789012345678",
+        max_length=200
+    )
+
+    def __init__(self, view):
+        super().__init__()
+        self.view = view
+
+    async def on_submit(self, interaction: discord.Interaction):
+        raw = self.identifiant.value.strip().strip("<>#@&")
+        ids = [part.strip() for part in raw.split(",") if part.strip()]
+
+        if not ids or not all(part.isdigit() for part in ids):
+            await interaction.response.send_message(
+                "❌ Indiquez un identifiant numérique, ou plusieurs séparés "
+                "par des virgules.",
+                ephemeral=True
+            )
+            return
+
+        notice = self.view._apply_picker(",".join(ids))
+        self.view.update_components()
+        await self.view.refresh_embed(interaction, notice)
+
 
 class WaitInputModal(discord.ui.Modal, title="Ajouter Pause"):
     duration = discord.ui.TextInput(
@@ -3831,13 +4329,13 @@ class WaitInputModal(discord.ui.Modal, title="Ajouter Pause"):
             return
 
         if high > low:
-            self.view.actions.append({"type": "wait", "delay_min": low, "delay_max": high})
+            self.view.add_action_block({"type": "wait", "delay_min": low, "delay_max": high})
         else:
-            self.view.actions.append({"type": "wait", "delay": low})
+            self.view.add_action_block({"type": "wait", "delay": low})
 
+        self.view.mode = "trame"
         self.view.update_components()
         await self.view.refresh_embed(interaction)
-
 
 class ChanceInputModal(discord.ui.Modal, title="Probabilité"):
     percent = discord.ui.TextInput(label="Pourcentage (0-100)", placeholder="30")
@@ -3859,10 +4357,10 @@ class ChanceInputModal(discord.ui.Modal, title="Probabilité"):
                 "❌ Le pourcentage doit être compris entre 0 et 100.", ephemeral=True)
             return
 
-        self.view.actions.append({"type": "chance", "percent": value})
+        self.view.add_action_block({"type": "chance", "percent": value})
+        self.view.mode = "trame"
         self.view.update_components()
         await self.view.refresh_embed(interaction)
-
 
 class VolumeInputModal(discord.ui.Modal, title="Changer le volume"):
     def __init__(self, view, max_volume: int = None):
@@ -3900,45 +4398,107 @@ class VolumeInputModal(discord.ui.Modal, title="Changer le volume"):
                 return
             raw = int(raw)
 
-        self.view.actions.append({"type": "volume", "value": raw})
+        self.view.add_action_block({"type": "volume", "value": raw})
+        self.view.mode = "trame"
         self.view.update_components()
         await self.view.refresh_embed(interaction)
 
 
-class MoveInputModal(discord.ui.Modal, title="Déplacer vers un salon"):
-    channel_id = discord.ui.TextInput(label="ID du salon vocal", placeholder="123456789012345678")
-    target = discord.ui.TextInput(
-        label="Qui déplacer ? (bot ou membre)",
-        placeholder="bot",
-        required=False,
-        default="bot"
-    )
+class ConditionFormModal(discord.ui.Modal):
+    """
+    Formulaire d'une condition précise.
 
-    def __init__(self, view):
-        super().__init__()
+    Les libellés, l'exemple et les opérateurs autorisés viennent du
+    catalogue : le formulaire s'adapte à la condition choisie au lieu de
+    demander un type que l'utilisateur devrait deviner.
+    """
+
+    def __init__(self, view, block):
+        super().__init__(title=f"Condition : {block.label or block.type}"[:45])
         self.view = view
+        self.block = block
+
+        self.value = discord.ui.TextInput(
+            label=block.value_label[:45],
+            placeholder=block.value_placeholder[:100],
+            max_length=200
+        )
+        self.add_item(self.value)
+
+        # Le choix de l'opérateur n'a de sens que s'il y en a plusieurs
+        self.operator = None
+        if len(block.ops) > 1:
+            self.operator = discord.ui.TextInput(
+                label=f"Comparaison ({' '.join(block.ops)})",
+                placeholder=block.default_op,
+                default=block.default_op,
+                required=False,
+                max_length=2
+            )
+            self.add_item(self.operator)
 
     async def on_submit(self, interaction: discord.Interaction):
-        cid = self.channel_id.value.strip().strip("<>#")
-        if not cid.isdigit():
-            await interaction.response.send_message("❌ ID de salon invalide.", ephemeral=True)
+        value = self.value.value.strip()
+        if not value:
+            await interaction.response.send_message(
+                "❌ Il faut indiquer une valeur.", ephemeral=True)
             return
 
-        raw_target = (self.target.value or "bot").strip().lower()
-        target = "member" if raw_target.startswith(("mem", "mbr", "user")) else "bot"
+        op = self.block.default_op
+        if self.operator is not None and self.operator.value.strip():
+            op = self.operator.value.strip()
 
-        self.view.actions.append({"type": "move", "target": target, "channel_id": cid})
+        if op not in self.block.ops:
+            await interaction.response.send_message(
+                f"❌ Comparaison « {op} » impossible pour cette condition. "
+                f"Utilisez : {', '.join(self.block.ops)}",
+                ephemeral=True
+            )
+            return
+
+        self.view.add_condition_block({
+            "type": self.block.type,
+            "value": value,
+            "op": op
+        })
+        self.view.mode = "trame"
         self.view.update_components()
         await self.view.refresh_embed(interaction)
 
-class LeaveInputModal(discord.ui.Modal, title="Quitter le salon vocal"):
-    """Choix entre quitter après la file et quitter tout de suite."""
 
-    attendre = discord.ui.TextInput(
-        label="Attendre la fin des sons ? (oui / non)",
-        placeholder="oui",
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+class MessageInputModal(discord.ui.Modal, title="Envoyer un message"):
+    """Saisie du texte ; le salon est choisi ensuite dans une liste."""
+
+    content = discord.ui.TextInput(
+        label="Texte du message",
+        placeholder="Salut {user} !",
+        style=discord.TextStyle.paragraph,
+        max_length=1500
+    )
+    prive = discord.ui.TextInput(
+        label="En message privé ? (oui / non)",
+        placeholder="non",
+        default="non",
         required=False,
-        default="oui",
         max_length=5
     )
 
@@ -3947,44 +4507,34 @@ class LeaveInputModal(discord.ui.Modal, title="Quitter le salon vocal"):
         self.view = view
 
     async def on_submit(self, interaction: discord.Interaction):
-        raw = (self.attendre.value or "oui").strip().lower()
-        attendre = not raw.startswith(("n", "no"))
+        content = self.content.value.strip()
+        if not content:
+            await interaction.response.send_message(
+                "❌ Le message ne peut pas être vide.", ephemeral=True)
+            return
 
-        self.view.actions.append({
-            "type": "player_control",
-            "command": "leave" if attendre else "leave_now"
-        })
+        if (self.prive.value or "non").strip().lower().startswith(("o", "y", "1")):
+            self.view.add_action_block({"type": "dm", "content": content})
+            self.view.mode = "trame"
+            self.view.update_components()
+            await self.view.refresh_embed(interaction)
+            return
+
+        # Le salon se choisit dans une liste, pas en recopiant un ID
+        self.view.picker = {
+            "component": "channel",
+            "purpose": "message",
+            "content": content,
+            "channel_types": [
+                discord.ChannelType.text,
+                discord.ChannelType.news,
+                discord.ChannelType.voice,
+            ],
+        }
+        self.view.mode = "picker"
         self.view.update_components()
         await self.view.refresh_embed(interaction)
 
-
-class MessageInputModal(discord.ui.Modal, title="Ajouter Message"):
-    content = discord.ui.TextInput(label="Message", placeholder="Coucou {user}!")
-    channel_id = discord.ui.TextInput(
-        label="ID Salon, ou 'mp'",
-        required=False,
-        placeholder="Vide = salon courant · 'mp' = message privé"
-    )
-
-    def __init__(self, view):
-        super().__init__()
-        self.view = view
-
-    async def on_submit(self, interaction: discord.Interaction):
-        cid = (self.channel_id.value or "").strip()
-
-        # "mp" transforme l'action en message privé au membre déclencheur
-        if cid.lower() in ("mp", "dm", "privé", "prive"):
-            self.view.actions.append({"type": "dm", "content": self.content.value})
-        else:
-            self.view.actions.append({
-                "type": "message",
-                "content": self.content.value,
-                "channel_id": cid or None
-            })
-
-        self.view.update_components()
-        await self.view.refresh_embed(interaction)
 
 class NameInputModal(discord.ui.Modal, title="Nommer la routine"):
     name = discord.ui.TextInput(label="Nom", placeholder="Ma Super Routine")
@@ -3993,6 +4543,8 @@ class NameInputModal(discord.ui.Modal, title="Nommer la routine"):
         self.view = view
     async def on_submit(self, interaction: discord.Interaction):
         self.view.name = self.name.value
+        self.view.saved = False
+        self.view.mode = "main"
         self.view.update_components()
         await self.view.refresh_embed(interaction)
 
@@ -4022,28 +4574,29 @@ async def routine_cmd(interaction: discord.Interaction, name: str, command: str)
         return
 
     try:
-        trigger_type, trigger_data, conditions, actions = bot.routine_manager.parse_routine_string(command)
+        trigger_data, trame = bot.routine_manager.parse_routine_string(command)
         
         await db.add_routine(
             str(interaction.guild_id),
             name,
-            trigger_type,
+            "v2",
             trigger_data,
-            actions,
-            conditions
+            trame,
+            None
         )
         await bot.routine_manager.load_routines()
         
-        # Build confirmation message
-        trigger_desc = describe_trigger(trigger_type, trigger_data)
-        actions_desc = " → ".join(describe_action(a) for a in actions)
-        
+        triggers = trigger_data["triggers"]
         embed = discord.Embed(title="✅ Routine créée", color=discord.Color.green())
-        embed.add_field(name="Nom", value=name, inline=True)
-        embed.add_field(name="Trigger", value=trigger_desc, inline=True)
-        embed.add_field(name="Actions", value=actions_desc or "Aucune", inline=False)
-        if conditions:
-            embed.add_field(name="Conditions", value=str(conditions), inline=False)
+        embed.add_field(name="Nom", value=name, inline=False)
+        embed.add_field(
+            name=f"⚡ Déclencheurs ({len(triggers)})",
+            value="\n".join(
+                f"• {describe_trigger(t['type'], t['data'])}" for t in triggers
+            ),
+            inline=False
+        )
+        embed.add_field(name="🧵 Trame", value=render_flat_trame(trame), inline=False)
         
         await interaction.response.send_message(embed=embed, ephemeral=True)
         

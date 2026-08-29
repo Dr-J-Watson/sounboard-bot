@@ -51,6 +51,11 @@ class Config:
     
     # === Configuration Bot ===
     VOICE_TIMEOUT_SECONDS: int = int(os.getenv("VOICE_TIMEOUT_SECONDS", "300"))  # 5 minutes par défaut
+    # Statut affiché par le bot sur Discord
+    ACTIVITY_TYPE: str = os.getenv("ACTIVITY_TYPE", "listening").lower()
+    ACTIVITY_TEXT: str = os.getenv("ACTIVITY_TEXT", "/play | /help")
+    STATUS: str = os.getenv("STATUS", "online").lower()
+
     DEFAULT_VOLUME: int = int(os.getenv("DEFAULT_VOLUME", "70"))       # volume de départ, en %
     DEFAULT_MAX_VOLUME: int = int(os.getenv("MAX_VOLUME", "200"))      # plafond par défaut, en %
     VOLUME_HARD_LIMIT: int = int(os.getenv("VOLUME_HARD_LIMIT", "500"))  # plafond absolu, non dépassable
@@ -92,6 +97,18 @@ class Config:
         
         if Config.MAX_FILE_SIZE_MB < 0:
             raise ValueError("MAX_FILE_SIZE_MB doit être positif ou nul.")
+        
+        valid_activities = {"playing", "listening", "watching", "competing", "custom"}
+        if Config.ACTIVITY_TYPE not in valid_activities:
+            raise ValueError(
+                f"ACTIVITY_TYPE doit être l'un de: {', '.join(sorted(valid_activities))}."
+            )
+        
+        valid_status = {"online", "idle", "dnd", "invisible"}
+        if Config.STATUS not in valid_status:
+            raise ValueError(
+                f"STATUS doit être l'un de: {', '.join(sorted(valid_status))}."
+            )
         
         if Config.VOLUME_HARD_LIMIT < 1:
             raise ValueError("VOLUME_HARD_LIMIT doit être au moins égal à 1.")

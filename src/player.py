@@ -34,11 +34,14 @@ class QueueItem:
         requester_name: Nom de l'utilisateur ayant demandé le son
         sound_name: Nom du son à jouer
         channel: Salon vocal cible
+        owner_guild_id: Serveur propriétaire du son ("global" pour les sons
+            partagés), pour incrémenter le bon compteur de lecture
     """
     source_path: str
     requester_name: str
     sound_name: str
     channel: VoiceLike
+    owner_guild_id: Optional[str] = None
 
 
 class GuildPlayer:
@@ -293,7 +296,8 @@ class GuildPlayer:
         source_path: str,
         requester_name: str,
         sound_name: str,
-        channel: VoiceLike
+        channel: VoiceLike,
+        owner_guild_id: Optional[str] = None
     ) -> int:
         """
         Ajoute un son à la file d'attente.
@@ -303,6 +307,9 @@ class GuildPlayer:
             requester_name: Nom de l'utilisateur
             sound_name: Nom du son
             channel: Salon vocal cible
+            owner_guild_id: Serveur propriétaire du son ("global" pour les
+                sons partagés). Sert à incrémenter le bon compteur de
+                lecture au démarrage effectif du son.
 
         Returns:
             Position dans la file d'attente
@@ -311,7 +318,8 @@ class GuildPlayer:
             source_path=source_path,
             requester_name=requester_name,
             sound_name=sound_name,
-            channel=channel
+            channel=channel,
+            owner_guild_id=owner_guild_id
         )
         self.queue.append(item)
         position = len(self.queue)
@@ -523,6 +531,17 @@ class GuildPlayer:
 
                 self.current_sound = (item.sound_name, item.requester_name)
                 logger.info(f"▶️ Lecture de '{item.sound_name}' dans {item.channel.name}")
+
+                # Le compteur est incrémenté ici, au démarrage réel de la
+                # lecture : toutes les sources comptent (commande, panel,
+                # routine), et un son jamais joué n'est pas compté.
+                if self.db is not None and item.owner_guild_id:
+                    try:
+                        await self.db.increment_play_count(
+                            item.owner_guild_id, item.sound_name
+                        )
+                    except Exception as e:
+                        logger.warning(f"Compteur de lecture non mis à jour: {e}")
 
                 try:
                     source = discord.FFmpegPCMAudio(

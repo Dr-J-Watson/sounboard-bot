@@ -23,124 +23,37 @@ from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass
 
 from config import Config
+from blocks import (
+    ACTION_BLOCKS,
+    CONDITION_BLOCKS,
+    WEEKDAYS,
+    action_by_verb,
+    all_action_verbs,
+    all_condition_aliases,
+    condition_by_alias,
+    describe_action,
+    describe_condition,
+    format_duration,
+    parse_duration_range,
+    parse_duration_seconds,
+)
+
+# Ces noms sont réexportés : bot.py les importe depuis ce module.
+__all__ = [
+    "RoutineManager",
+    "RoutineContext",
+    "ACTION_BLOCKS",
+    "CONDITION_BLOCKS",
+    "WEEKDAYS",
+    "describe_action",
+    "describe_condition",
+    "format_duration",
+    "parse_duration_range",
+    "parse_duration_seconds",
+]
 
 logger = logging.getLogger(__name__)
 
-
-# Durées composées : "1m20s", "2h", "90", "1h30m10s"
-_DURATION_TOKEN_RE = re.compile(r'(\d+)\s*([hms])', re.IGNORECASE)
-_UNIT_SECONDS = {'h': 3600, 'm': 60, 's': 1}
-
-# Jours de la semaine acceptés dans les routines (index lundi=0)
-WEEKDAYS = {
-    'lun': 0, 'lundi': 0, 'mon': 0, 'monday': 0,
-    'mar': 1, 'mardi': 1, 'tue': 1, 'tuesday': 1,
-    'mer': 2, 'mercredi': 2, 'wed': 2, 'wednesday': 2,
-    'jeu': 3, 'jeudi': 3, 'thu': 3, 'thursday': 3,
-    'ven': 4, 'vendredi': 4, 'fri': 4, 'friday': 4,
-    'sam': 5, 'samedi': 5, 'sat': 5, 'saturday': 5,
-    'dim': 6, 'dimanche': 6, 'sun': 6, 'sunday': 6,
-}
-
-
-def parse_duration_seconds(text: str) -> int:
-    """
-    Convertit une durée écrite en secondes.
-
-    Accepte les formes composées et les unités mélangées :
-    "30s", "5m", "2h", "1m20s", "1h30m10s", ou un nombre nu (= secondes).
-
-    Args:
-        text: Durée à convertir
-
-    Returns:
-        Durée en secondes
-
-    Raises:
-        ValueError: Si le format n'est pas reconnu
-    """
-    if text is None:
-        raise ValueError("Durée vide.")
-
-    cleaned = str(text).strip().lower().replace(" ", "")
-    if not cleaned:
-        raise ValueError("Durée vide.")
-
-    # Nombre nu : interprété en secondes
-    if cleaned.isdigit():
-        return int(cleaned)
-
-    matches = _DURATION_TOKEN_RE.findall(cleaned)
-    if not matches:
-        raise ValueError(
-            f"Format de durée invalide '{text}'. "
-            "Utilisez par exemple 30s, 5m, 2h ou 1m20s."
-        )
-
-    # Refuser les restes non reconnus ("5x", "1m20z")
-    consumed = "".join(f"{value}{unit}" for value, unit in matches)
-    if consumed != cleaned:
-        raise ValueError(
-            f"Format de durée invalide '{text}'. "
-            "Utilisez par exemple 30s, 5m, 2h ou 1m20s."
-        )
-
-    return sum(int(value) * _UNIT_SECONDS[unit.lower()] for value, unit in matches)
-
-
-def parse_duration_range(text: str) -> Tuple[int, int]:
-    """
-    Convertit une durée ou une plage de durées en secondes.
-
-    "5s" donne (5, 5) ; "1m20s-2h" donne (80, 7200). Les bornes sont
-    réordonnées si elles sont écrites à l'envers.
-
-    Args:
-        text: Durée simple ou plage "min-max"
-
-    Returns:
-        Tuple (minimum, maximum) en secondes
-
-    Raises:
-        ValueError: Si le format n'est pas reconnu
-    """
-    cleaned = str(text).strip().lower().replace(" ", "")
-
-    if "-" in cleaned:
-        low_raw, _, high_raw = cleaned.partition("-")
-        low = parse_duration_seconds(low_raw)
-        high = parse_duration_seconds(high_raw)
-        return (low, high) if low <= high else (high, low)
-
-    value = parse_duration_seconds(cleaned)
-    return value, value
-
-
-def format_duration(seconds: int) -> str:
-    """
-    Formate une durée en secondes de façon lisible ("1m20s", "2h").
-
-    Args:
-        seconds: Durée en secondes
-
-    Returns:
-        Représentation compacte de la durée
-    """
-    seconds = int(seconds)
-    if seconds <= 0:
-        return "0s"
-
-    hours, rest = divmod(seconds, 3600)
-    minutes, secs = divmod(rest, 60)
-
-    parts = []
-    if hours:
-        parts.append(f"{hours}h")
-    if minutes:
-        parts.append(f"{minutes}m")
-    if secs or not parts:
-        parts.append(f"{secs}s")
-    return "".join(parts)
 
 
 @dataclass
@@ -241,6 +154,7 @@ class RoutineManager:
         # chaque on_ready (donc à chaque reconnexion gateway). Repartir de 0
         # faisait redéclencher toutes les routines timer d'un coup.
         previous_runs = {r['id']: r.get('_last_run', 0) for r in self.routines}
+        previous_states = {r['id']: r.get('_sub_state', {}) for r in self.routines}
         now = time.time()
         
         self.routines = []
@@ -254,6 +168,12 @@ class RoutineManager:
                         # une nouvelle démarre maintenant plutôt que de se
                         # déclencher immédiatement.
                         r['_last_run'] = previous_runs.get(r['id'], now)
+                        # Chaque déclencheur temporel garde son propre état
+                        r['_sub_state'] = previous_states.get(r['id']) or {
+                            i: {'_last_run': now}
+                            for i, t_type, _ in self.iter_triggers(r)
+                            if t_type in ('timer', 'schedule')
+                        }
                         self.routines.append(r)
             except Exception as e:
                 logger.error(f"Erreur lors du chargement des routines pour {guild.id}: {e}")
@@ -306,10 +226,15 @@ class RoutineManager:
                 current_time = time.time()
                 
                 for routine in self.routines:
-                    if routine['trigger_type'] == 'timer':
-                        await self._process_timer_routine(routine, current_time)
-                    elif routine['trigger_type'] == 'schedule':
-                        await self._process_schedule_routine(routine, current_time)
+                    for index, t_type, t_data in self.iter_triggers(routine):
+                        if t_type == 'timer':
+                            await self._process_timer_routine(
+                                routine, current_time, index, t_data
+                            )
+                        elif t_type == 'schedule':
+                            await self._process_schedule_routine(
+                                routine, current_time, index, t_data
+                            )
                         
             except asyncio.CancelledError:
                 break
@@ -318,18 +243,29 @@ class RoutineManager:
             
             await asyncio.sleep(1)
 
-    async def _process_timer_routine(self, routine: Dict, current_time: float) -> None:
+    async def _process_timer_routine(
+        self,
+        routine: Dict,
+        current_time: float,
+        index: int = 0,
+        trigger_data: Optional[Dict] = None
+    ) -> None:
         """
-        Traite une routine de type timer.
+        Traite un déclencheur de type timer.
         
         Args:
             routine: Données de la routine
             current_time: Timestamp actuel
+            index: Index du déclencheur dans la routine
+            trigger_data: Données du déclencheur (celles de la routine par défaut)
         """
-        last_run = routine.get('_last_run', 0)
-        trigger_data = routine['trigger_data']
+        if trigger_data is None:
+            trigger_data = routine['trigger_data']
         
-        interval = self._resolve_interval(routine)
+        state = self._trigger_state(routine, index)
+        last_run = state.get('_last_run', 0)
+        
+        interval = self._resolve_interval(trigger_data, state)
         if interval <= 0:
             return
         
@@ -348,12 +284,12 @@ class RoutineManager:
             # Marquer AVANT de lancer les actions : sinon une action longue
             # laisserait la boucle redéclencher la routine à la seconde
             # suivante.
-            routine['_last_run'] = current_time
+            state['_last_run'] = current_time
             
             # Intervalle aléatoire : on retire au sort pour le prochain tour
             if trigger_data.get('interval_max') is not None:
-                routine.pop('_next_interval', None)
-                next_interval = self._resolve_interval(routine)
+                state.pop('_next_interval', None)
+                next_interval = self._resolve_interval(trigger_data, state)
                 logger.debug(
                     f"Timer routine '{routine['name']}' exécutée, "
                     f"prochain déclenchement dans {format_duration(next_interval)}"
@@ -364,7 +300,49 @@ class RoutineManager:
             self._spawn_actions(routine, context)
 
     @staticmethod
-    def _resolve_interval(routine: Dict) -> int:
+    def iter_triggers(routine: Dict) -> List[Tuple[int, str, Dict]]:
+        """
+        Énumère les déclencheurs d'une routine.
+
+        Une routine v2 porte une liste de déclencheurs dans
+        trigger_data["triggers"]. Ils fonctionnent en OU : n'importe lequel
+        déclenche la trame.
+
+        Args:
+            routine: Données de la routine
+
+        Returns:
+            Liste de tuples (index, type, données)
+        """
+        trigger_data = routine.get('trigger_data') or {}
+
+        return [
+            (i, sub.get('type'), sub.get('data') or {})
+            for i, sub in enumerate(trigger_data.get('triggers', []))
+        ]
+
+    @staticmethod
+    def _trigger_state(routine: Dict, index: int) -> Dict:
+        """
+        Récupère l'état d'exécution propre à un déclencheur.
+
+        Chaque déclencheur temporel a besoin de son propre `_last_run` :
+        deux timers dans la même routine ne se déclenchent pas ensemble.
+        Pour une routine à déclencheur unique, l'état est porté par la
+        routine elle-même, ce qui préserve le comportement existant.
+
+        Args:
+            routine: Données de la routine
+            index: Index du déclencheur
+
+        Returns:
+            Le dictionnaire d'état à lire et écrire
+        """
+        states = routine.setdefault('_sub_state', {})
+        return states.setdefault(index, {'_last_run': routine.get('_last_run', 0)})
+
+    @staticmethod
+    def _resolve_interval(trigger_data: Dict, state: Dict) -> int:
         """
         Détermine l'intervalle courant d'une routine timer, en secondes.
 
@@ -374,22 +352,21 @@ class RoutineManager:
         renouvelé après chaque déclenchement.
 
         Args:
-            routine: Données de la routine
+            trigger_data: Données du déclencheur
+            state: Dictionnaire d'état où mémoriser le tirage
 
         Returns:
             L'intervalle à respecter, en secondes
         """
-        trigger_data = routine['trigger_data']
-
         low = trigger_data.get('interval_min')
         high = trigger_data.get('interval_max')
 
         if low is not None and high is not None:
-            cached = routine.get('_next_interval')
+            cached = state.get('_next_interval')
             if cached is None:
                 low, high = int(low), int(high)
                 cached = random.randint(low, high) if high > low else low
-                routine['_next_interval'] = cached
+                state['_next_interval'] = cached
             return cached
 
         interval = trigger_data.get('interval_seconds', 0)
@@ -397,7 +374,13 @@ class RoutineManager:
             interval = trigger_data.get('interval_minutes', 0) * 60
         return int(interval)
 
-    async def _process_schedule_routine(self, routine: Dict, current_time: float) -> None:
+    async def _process_schedule_routine(
+        self,
+        routine: Dict,
+        current_time: float,
+        index: int = 0,
+        trigger_data: Optional[Dict] = None
+    ) -> None:
         """
         Traite une routine déclenchée à heure fixe ("at 18:00").
 
@@ -409,7 +392,10 @@ class RoutineManager:
             routine: Données de la routine
             current_time: Timestamp actuel
         """
-        trigger_data = routine['trigger_data']
+        if trigger_data is None:
+            trigger_data = routine['trigger_data']
+        
+        state = self._trigger_state(routine, index)
         target = trigger_data.get('time')
         if not target:
             return
@@ -427,7 +413,7 @@ class RoutineManager:
 
         # Une seule exécution par minute, même si la boucle tourne à 1 Hz
         minute_start = current_time - now.second - (now.microsecond / 1_000_000)
-        if routine.get('_last_run', 0) >= minute_start:
+        if state.get('_last_run', 0) >= minute_start:
             return
 
         guild = self.bot.get_guild(int(routine['guild_id']))
@@ -436,7 +422,7 @@ class RoutineManager:
 
         context = await self._find_valid_context(routine, guild)
         if context:
-            routine['_last_run'] = current_time
+            state['_last_run'] = current_time
             self._spawn_actions(routine, context)
             logger.debug(f"Routine horaire '{routine['name']}' exécutée à {target}")
 
@@ -563,36 +549,83 @@ class RoutineManager:
 
             # Exécuter les routines correspondantes
             for routine in self.routines:
-                # Éviter les doublons (ex: une routine voice_join ne doit pas se déclencher 2 fois)
+                # Une routine ne se déclenche qu'une fois par événement, même
+                # si plusieurs de ses déclencheurs correspondent.
                 routine_key = (routine['id'], event_type)
                 if routine_key in triggered_routines:
                     continue
-                    
-                logger.debug(f"Vérification routine '{routine['name']}' pour {event_type}")
                 
                 if str(routine['guild_id']) != str(member.guild.id):
                     continue
                 
-                if routine['trigger_type'] != 'event':
-                    continue
-                    
-                if routine['trigger_data'].get('event') != event_type:
+                # Les déclencheurs d'une routine fonctionnent en OU
+                if not self._matches_voice_event(routine, event_type, human_count):
                     continue
                 
-                # Palier de membres : la routine ne se déclenche que sur le
-                # nombre exact demandé, pour ne pas re-jouer à chaque arrivée.
-                if event_type == "voice_count_reached":
-                    expected = routine['trigger_data'].get('count')
-                    if expected is None or human_count != int(expected):
-                        continue
+                logger.debug(f"Routine '{routine['name']}' correspond à {event_type}")
                 
-                logger.debug("  -> Vérification des conditions...")
                 if await self._check_conditions(routine, context):
                     logger.info(f"🎯 Routine '{routine['name']}' déclenchée par {event_type}")
                     triggered_routines.add(routine_key)
                     self._spawn_actions(routine, context)
                 else:
                     logger.debug("  -> Conditions non satisfaites")
+
+    @staticmethod
+    def _channel_allowed(trigger_data: Dict, channel) -> bool:
+        """
+        Vérifie qu'un déclencheur accepte le salon où l'événement a eu lieu.
+
+        Une liste vide ou absente signifie « tous les salons » : c'est le
+        comportement par défaut, un déclencheur non restreint reste global.
+
+        Args:
+            trigger_data: Données du déclencheur
+            channel: Salon de l'événement
+
+        Returns:
+            True si le déclencheur s'applique à ce salon
+        """
+        allowed = trigger_data.get('channels') or []
+        if not allowed:
+            return True
+
+        if channel is None:
+            return False
+
+        return str(channel.id) in {str(c) for c in allowed}
+
+    def _matches_voice_event(
+        self,
+        routine: Dict,
+        event_type: str,
+        human_count: Optional[int]
+    ) -> bool:
+        """
+        Indique si l'un des déclencheurs de la routine correspond à l'événement.
+
+        Args:
+            routine: Données de la routine
+            event_type: Événement détecté
+            human_count: Nombre d'humains dans le salon après l'événement
+
+        Returns:
+            True si au moins un déclencheur correspond
+        """
+        for _, t_type, t_data in self.iter_triggers(routine):
+            if t_type != 'event' or t_data.get('event') != event_type:
+                continue
+
+            # Palier de membres : seul le nombre exact déclenche, sinon la
+            # routine repartirait à chaque nouvelle arrivée.
+            if event_type == "voice_count_reached":
+                expected = t_data.get('count')
+                if expected is None or human_count != int(expected):
+                    continue
+
+            return True
+
+        return False
 
     async def on_message(self, message: discord.Message) -> None:
         """
@@ -615,15 +648,21 @@ class RoutineManager:
         )
 
         for routine in self.routines:
-            if routine['trigger_type'] != 'event':
-                continue
-            if routine['trigger_data'].get('event') != 'message':
-                continue
             if str(routine['guild_id']) != str(message.guild.id):
                 continue
 
-            keyword = (routine['trigger_data'].get('keyword') or "").lower().strip()
-            if not keyword or keyword not in content:
+            matched = False
+            for _, t_type, t_data in self.iter_triggers(routine):
+                if t_type != 'event' or t_data.get('event') != 'message':
+                    continue
+                if not self._channel_allowed(t_data, message.channel):
+                    continue
+                keyword = (t_data.get('keyword') or "").lower().strip()
+                if keyword and keyword in content:
+                    matched = True
+                    break
+
+            if not matched:
                 continue
 
             if await self._check_conditions(routine, context):
@@ -650,15 +689,21 @@ class RoutineManager:
         context = RoutineContext(guild=member.guild, channel=channel, member=member)
 
         for routine in self.routines:
-            if routine['trigger_type'] != 'event':
-                continue
-            if routine['trigger_data'].get('event') != 'reaction':
-                continue
             if str(routine['guild_id']) != str(member.guild.id):
                 continue
 
-            expected = (routine['trigger_data'].get('emoji') or "").strip()
-            if expected and expected != emoji:
+            matched = False
+            for _, t_type, t_data in self.iter_triggers(routine):
+                if t_type != 'event' or t_data.get('event') != 'reaction':
+                    continue
+                if not self._channel_allowed(t_data, channel):
+                    continue
+                expected = (t_data.get('emoji') or "").strip()
+                if not expected or expected == emoji:
+                    matched = True
+                    break
+
+            if not matched:
                 continue
 
             if await self._check_conditions(routine, context):
@@ -809,86 +854,137 @@ class RoutineManager:
         context: Optional[Dict]
     ) -> bool:
         """
-        Évalue une condition feuille (non composite).
-        
-        Types supportés:
-        - user_id: ID d'utilisateur (liste possible: "1,2,3")
-        - channel_id: ID de salon (liste possible)
-        - role_id: ID de rôle (liste possible)
-        - time_range: Plage horaire (HH:MM-HH:MM)
-        - date_range: Plage de dates (DD/MM-DD/MM)
-        - member_count: Nombre d'humains dans le salon (ops >, <, >=, <=)
-        - chance: Probabilité en pourcentage
-        - weekday: Jours de la semaine ("lun,mar,ven")
-        - is_playing: Le bot est-il déjà en train de jouer ("true"/"false")
-        
+        Évalue une condition feuille en s'appuyant sur le catalogue.
+
+        Les types disponibles sont déclarés dans blocks.CONDITION_BLOCKS ;
+        chacun désigne la méthode qui l'évalue.
+
         Args:
             node: Nœud de condition
             context: Contexte d'exécution
-            
+
         Returns:
             True si la condition est satisfaite
         """
         c_type = node.get('type')
         op = node.get('op', '==')
         value = str(node.get('value', ''))
-        
+
+        block = CONDITION_BLOCKS.get(c_type)
+        if block is None:
+            logger.warning(f"Type de condition inconnu: {c_type}")
+            return False
+
+        handler = getattr(self, block.handler, None)
+        if handler is None:
+            logger.error(
+                f"Condition '{c_type}' déclarée avec le handler "
+                f"'{block.handler}', qui n'existe pas dans RoutineManager."
+            )
+            return False
+
         logger.debug(f"Évaluation condition: type={c_type}, op={op}, value={value}")
-        
-        # Récupérer la valeur actuelle selon le type
-        actual_value = None
-        
-        if c_type == 'user_id':
-            if context and context.get('member'):
-                actual_value = str(context['member'].id)
-                logger.debug(f"  user_id: actual={actual_value}, expected={value}")
-                
-        elif c_type == 'channel_id':
-            if context and context.get('channel'):
-                actual_value = str(context['channel'].id)
-                
-        elif c_type == 'role_id':
-            if context and context.get('member'):
-                member_roles = [str(r.id) for r in context['member'].roles]
-                if op == '==':
-                    return value in member_roles
-                elif op == '!=':
-                    return value not in member_roles
-            return False
-            
-        elif c_type == 'time_range':
-            return self._check_time_range(value)
-            
-        elif c_type == 'date_range':
-            return self._check_date_range(value)
-        
-        elif c_type == 'member_count':
-            return self._check_member_count(op, value, context)
-        
-        elif c_type == 'chance':
-            return self._check_chance(value)
-        
-        elif c_type == 'weekday':
-            return self._check_weekday(op, value)
-        
-        elif c_type == 'is_playing':
-            return self._check_is_playing(op, value, context)
+        return bool(handler(op, value, context))
 
-        # Comparaison standard
-        if actual_value is None:
+    # --- Évaluateurs de conditions (signature commune op, value, context) ---
+
+    @staticmethod
+    def _compare_values(op: str, actual: Optional[str], value: str) -> bool:
+        """
+        Compare une valeur du contexte à celle attendue.
+
+        La valeur attendue peut lister plusieurs entrées séparées par des
+        virgules : l'appartenance à la liste fait alors office d'égalité.
+
+        Args:
+            op: Opérateur (== ou !=)
+            actual: Valeur constatée, ou None si absente du contexte
+            value: Valeur attendue
+
+        Returns:
+            Résultat de la comparaison
+        """
+        if actual is None:
             return False
 
-        # Une valeur peut lister plusieurs IDs séparés par des virgules
         if ',' in value:
             allowed = {v.strip() for v in value.split(',') if v.strip()}
-            return actual_value in allowed if op == '==' else actual_value not in allowed
+            return actual in allowed if op == '==' else actual not in allowed
 
-        if op == '==':
-            return actual_value == value
-        elif op == '!=':
-            return actual_value != value
-        
-        return False
+        return actual != value if op == '!=' else actual == value
+
+    def _check_user(self, op: str, value: str, context: Optional[Dict]) -> bool:
+        """Compare l'auteur du déclenchement."""
+        member = context.get('member') if context else None
+        return self._compare_values(op, str(member.id) if member else None, value)
+
+    def _check_channel(self, op: str, value: str, context: Optional[Dict]) -> bool:
+        """Compare le salon concerné."""
+        channel = context.get('channel') if context else None
+        return self._compare_values(op, str(channel.id) if channel else None, value)
+
+    def _check_role(self, op: str, value: str, context: Optional[Dict]) -> bool:
+        """Vérifie qu'un membre possède (ou non) l'un des rôles listés."""
+        member = context.get('member') if context else None
+        if member is None:
+            return False
+
+        member_roles = {str(r.id) for r in getattr(member, 'roles', [])}
+        wanted = {v.strip() for v in value.split(',') if v.strip()}
+
+        has_any = bool(member_roles & wanted)
+        return not has_any if op == '!=' else has_any
+
+    def _check_queue_length(self, op: str, value: str, context: Optional[Dict]) -> bool:
+        """Compare le nombre de sons en attente."""
+        guild = context.get('guild') if context else None
+        if guild is None:
+            return False
+
+        player = self.bot.player_manager.find_player(guild.id)
+        length = player.get_queue_info()['queue_length'] if player else 0
+
+        try:
+            expected = int(value)
+        except (TypeError, ValueError):
+            logger.warning(f"Valeur invalide pour queue_length: {value}")
+            return False
+
+        return self._compare_numbers(op, length, expected)
+
+    def _check_bot_connected(self, op: str, value: str, context: Optional[Dict]) -> bool:
+        """Indique si le bot est déjà présent dans un salon vocal."""
+        guild = context.get('guild') if context else None
+        if guild is None:
+            return False
+
+        player = self.bot.player_manager.find_player(guild.id)
+        voice = player.voice_client if player else None
+        connected = bool(voice and voice.is_connected())
+
+        expected = str(value).lower() in ('true', 'vrai', '1', 'oui')
+        return connected == expected
+
+    def _check_is_bot(self, op: str, value: str, context: Optional[Dict]) -> bool:
+        """Indique si l'auteur du déclenchement est un bot."""
+        member = context.get('member') if context else None
+        if member is None:
+            return False
+
+        expected = str(value).lower() in ('true', 'vrai', '1', 'oui')
+        return bool(getattr(member, 'bot', False)) == expected
+
+    def _check_time_condition(self, op: str, value: str, context: Optional[Dict]) -> bool:
+        """Vérifie la plage horaire."""
+        return self._check_time_range(value)
+
+    def _check_date_condition(self, op: str, value: str, context: Optional[Dict]) -> bool:
+        """Vérifie la plage de dates."""
+        return self._check_date_range(value)
+
+    def _check_chance_condition(self, op: str, value: str, context: Optional[Dict]) -> bool:
+        """Tire au sort selon la probabilité donnée."""
+        return self._check_chance(value)
 
     @staticmethod
     def _compare_numbers(op: str, actual: float, expected: float) -> bool:
@@ -964,7 +1060,7 @@ class RoutineManager:
         return result
 
     @staticmethod
-    def _check_weekday(op: str, value: str) -> bool:
+    def _check_weekday(op: str, value: str, context: Optional[Dict] = None) -> bool:
         """
         Vérifie le jour de la semaine courant.
 
@@ -1090,73 +1186,266 @@ class RoutineManager:
             logger.error(f"Format date_range invalide '{value}': {e}")
             return False
 
+    # ------------------------------------------------------------------
+    # Exécution de la trame
+    # ------------------------------------------------------------------
+
+    # Profondeur maximale d'imbrication, garde-fou contre les trames
+    # construites à la main avec une récursion absurde
+    MAX_TRAME_DEPTH = 10
+
+    @staticmethod
+    def build_tree(flat: List[Dict]) -> List[Dict]:
+        """
+        Reconstruit l'arbre d'exécution à partir de la liste à plat.
+
+        La trame est stockée à plat, chaque bloc portant sa profondeur.
+        C'est ce qui rend l'édition simple (monter, descendre, indenter
+        reviennent à manipuler une liste), mais l'exécution a besoin de
+        l'imbrication réelle.
+
+        Args:
+            flat: Liste de blocs, chacun avec une clé `depth`
+
+        Returns:
+            Liste des blocs racines, chaque bloc portant ses `children`
+        """
+        roots: List[Dict] = []
+        # Pile des blocs ouverts, indexée par profondeur
+        stack: List[Dict] = []
+
+        for block in flat:
+            node = dict(block)
+            node['children'] = []
+            depth = max(0, int(node.get('depth', 0)))
+
+            # Un bloc ne peut pas s'enfoncer de plus d'un niveau, ni se
+            # rattacher à autre chose qu'un bloc conditionnel.
+            while len(stack) > depth:
+                stack.pop()
+
+            if stack and len(stack) == depth:
+                stack[-1]['children'].append(node)
+            else:
+                roots.append(node)
+                stack.clear()
+
+            if node.get('kind') == 'if':
+                stack.append(node)
+            elif stack and len(stack) == depth:
+                pass
+
+        return roots
+
     async def _execute_actions(
         self,
         routine: Dict,
         context: Optional[RoutineContext]
     ) -> None:
         """
-        Exécute les actions d'une routine.
-        
+        Exécute la trame d'une routine.
+
         Args:
             routine: Données de la routine
             context: Contexte d'exécution
         """
-        actions = routine.get('actions', [])
-        
-        logger.debug(f"Exécution de {len(actions)} action(s) pour routine '{routine['name']}'")
-        
-        for i, action in enumerate(actions):
+        flat = routine.get('actions') or []
+        tree = self.build_tree(flat)
+
+        logger.debug(
+            f"Exécution de la trame de '{routine['name']}' "
+            f"({len(flat)} bloc(s))"
+        )
+
+        await self._execute_nodes(tree, routine, context)
+
+    async def _execute_nodes(
+        self,
+        nodes: List[Dict],
+        routine: Dict,
+        context: Optional[RoutineContext],
+        depth: int = 0
+    ) -> bool:
+        """
+        Exécute une suite de blocs de même niveau.
+
+        Les blocs frères s'enchaînent normalement. Un bloc marqué `or`
+        n'est évalué que si le précédent n'a pas été exécuté : c'est le
+        « sinon si » de la trame.
+
+        Args:
+            nodes: Blocs à exécuter
+            routine: Routine parente (pour les logs et le contexte)
+            context: Contexte d'exécution
+            depth: Profondeur courante, pour le garde-fou
+
+        Returns:
+            True si la routine doit être interrompue entièrement
+        """
+        if depth > self.MAX_TRAME_DEPTH:
+            logger.warning(
+                f"Trame de '{routine['name']}' trop imbriquée "
+                f"(>{self.MAX_TRAME_DEPTH}), branche ignorée"
+            )
+            return False
+
+        previous_ran = False
+
+        for node in nodes:
+            # Chaînage « ou » : on saute si la branche précédente a déjà pris
+            if node.get('link') == 'or' and previous_ran:
+                continue
+
+            kind = node.get('kind', 'action')
+
             try:
-                action_type = action.get('type')
-                logger.debug(f"Action {i+1}/{len(actions)}: type={action_type}, data={action}")
-                
-                # Gestion de l'attente (wait), éventuellement aléatoire
-                if action_type == 'wait':
-                    delay = self._resolve_delay(action)
-                    if delay > 0:
-                        logger.debug(f"⏳ Attente de {format_duration(delay)}...")
-                        await asyncio.sleep(delay)
-                    continue
-                
-                # Tirage au sort : coupe la routine si le tirage échoue
-                if action_type == 'chance':
-                    percent = action.get('percent', 100)
-                    if not self._check_chance(percent):
-                        logger.debug(f"🎲 Tirage {percent}% raté, routine interrompue")
-                        return
-                    logger.debug(f"🎲 Tirage {percent}% réussi")
-                    continue
-                
-                # Pour les autres actions, reconstruire le contexte frais
-                # car après un délai, le membre peut avoir changé de salon
-                fresh_context = None
-                if context:
-                    fresh_context = await self._refresh_context(context, routine)
-                
-                ctx_dict = fresh_context.to_dict() if fresh_context else None
-                
-                if action_type == 'play_sound':
-                    await self._action_play_sound(action, ctx_dict, routine)
-                elif action_type == 'message':
-                    await self._action_send_message(action, ctx_dict)
-                elif action_type == 'dm':
-                    await self._action_send_dm(action, ctx_dict)
-                elif action_type == 'player_control':
-                    await self._action_player_control(action, ctx_dict)
-                elif action_type == 'volume':
-                    await self._action_set_volume(action, ctx_dict)
-                elif action_type == 'move':
-                    await self._action_move(action, ctx_dict)
+                if kind == 'if':
+                    matched = await self._check_block_conditions(node, context)
+                    logger.debug(
+                        f"{'  ' * depth}🤔 Bloc condition -> "
+                        f"{'vrai' if matched else 'faux'}"
+                    )
+                    if matched:
+                        stop = await self._execute_nodes(
+                            node.get('children', []), routine, context, depth + 1
+                        )
+                        if stop:
+                            return True
+                    previous_ran = matched
                 else:
-                    logger.warning(f"Type d'action inconnu: {action_type}")
-                    
+                    stop = await self._run_action(node.get('action') or {}, routine, context)
+                    if stop:
+                        return True
+                    previous_ran = True
+
             except Exception as e:
                 logger.error(
-                    f"Erreur lors de l'exécution de l'action {action} "
-                    f"dans la routine '{routine['name']}': {e}",
+                    f"Erreur dans un bloc de la routine '{routine['name']}': {e}",
                     exc_info=True
                 )
+                previous_ran = False
+
+        return False
+
+    async def _check_block_conditions(
+        self,
+        node: Dict,
+        context: Optional[RoutineContext]
+    ) -> bool:
+        """
+        Évalue les conditions d'un bloc conditionnel.
+
+        Args:
+            node: Bloc de type `if`
+            context: Contexte d'exécution
+
+        Returns:
+            True si le bloc doit s'exécuter
+        """
+        conditions = node.get('conditions') or []
+        if not conditions:
+            return True
+
+        ctx_dict = context.to_dict() if context else None
+        logic = node.get('logic', 'AND')
+
+        if len(conditions) == 1:
+            return await self._evaluate_condition_node(conditions[0], ctx_dict)
+
+        return await self._evaluate_condition_node(
+            {'type': logic, 'sub': conditions}, ctx_dict
+        )
+
+    async def _run_action(
+        self,
+        action: Dict,
+        routine: Dict,
+        context: Optional[RoutineContext]
+    ) -> bool:
+        """
+        Exécute une action unique.
+
+        Args:
+            action: Données de l'action
+            routine: Routine parente
+            context: Contexte d'exécution
+
+        Returns:
+            True si la routine entière doit être interrompue
+        """
+        action_type = action.get('type')
+        block = ACTION_BLOCKS.get(action_type)
+
+        if block is None:
+            logger.warning(f"Type d'action inconnu: {action_type}")
+            return False
+
+        logger.debug(f"Action: type={action_type}, data={action}")
+
+        # Le contexte est reconstruit avant les actions qui s'en servent :
+        # après une attente, le membre a pu changer de salon.
+        ctx_dict = None
+        if block.refresh_context and context:
+            fresh_context = await self._refresh_context(context, routine)
+            ctx_dict = fresh_context.to_dict() if fresh_context else None
+
+        handler = getattr(self, block.handler, None)
+        if handler is None:
+            logger.error(
+                f"Bloc '{action_type}' déclaré avec le handler '{block.handler}', "
+                "qui n'existe pas dans RoutineManager."
+            )
+            return False
+
+        return bool(await handler(action, ctx_dict, routine))
+
+    async def _action_wait(
+        self,
+        action: Dict,
+        context: Optional[Dict] = None,
+        routine: Optional[Dict] = None
+    ) -> bool:
+        """
+        Met la trame en pause, d'une durée fixe ou tirée dans une plage.
+
+        Args:
+            action: Données de l'action
+            context: Inutilisé
+            routine: Inutilisé
+
+        Returns:
+            False : une pause n'interrompt jamais la routine
+        """
+        delay = self._resolve_delay(action)
+        if delay > 0:
+            logger.debug(f"⏳ Attente de {format_duration(delay)}...")
+            await asyncio.sleep(delay)
+        return False
+
+    async def _action_chance(
+        self,
+        action: Dict,
+        context: Optional[Dict] = None,
+        routine: Optional[Dict] = None
+    ) -> bool:
+        """
+        Tire au sort la poursuite de la routine.
+
+        Args:
+            action: Données de l'action
+            context: Inutilisé
+            routine: Inutilisé
+
+        Returns:
+            True si le tirage échoue, ce qui interrompt toute la routine
+        """
+        percent = action.get('percent', 100)
+        if not self._check_chance(percent):
+            logger.debug(f"🎲 Tirage {percent}% raté, routine interrompue")
+            return True
+
+        logger.debug(f"🎲 Tirage {percent}% réussi")
+        return False
 
     @staticmethod
     def _resolve_delay(action: Dict) -> int:
@@ -1197,7 +1486,12 @@ class RoutineManager:
             return None
         return self.bot.player_manager.find_player(guild.id)
 
-    async def _action_player_control(self, action: Dict, context: Optional[Dict]) -> None:
+    async def _action_player_control(
+        self,
+        action: Dict,
+        context: Optional[Dict] = None,
+        routine: Optional[Dict] = None
+    ) -> bool:
         """
         Pilote la lecture : stop, skip, clear ou leave.
 
@@ -1240,7 +1534,12 @@ class RoutineManager:
         else:
             logger.warning(f"Commande de contrôle inconnue: {command}")
 
-    async def _action_set_volume(self, action: Dict, context: Optional[Dict]) -> None:
+    async def _action_set_volume(
+        self,
+        action: Dict,
+        context: Optional[Dict] = None,
+        routine: Optional[Dict] = None
+    ) -> bool:
         """
         Change le volume de lecture pour la session en cours.
 
@@ -1283,7 +1582,12 @@ class RoutineManager:
         else:
             logger.info(f"🔊 Routine: volume réglé sur {round(applied * 100)}%")
 
-    async def _action_move(self, action: Dict, context: Optional[Dict]) -> None:
+    async def _action_move(
+        self,
+        action: Dict,
+        context: Optional[Dict] = None,
+        routine: Optional[Dict] = None
+    ) -> bool:
         """
         Déplace le bot ou le membre déclencheur vers un salon vocal.
 
@@ -1321,7 +1625,12 @@ class RoutineManager:
         if await player.join(channel):
             logger.info(f"↔️ Routine: bot déplacé vers {channel.name}")
 
-    async def _action_send_dm(self, action: Dict, context: Optional[Dict]) -> None:
+    async def _action_send_dm(
+        self,
+        action: Dict,
+        context: Optional[Dict] = None,
+        routine: Optional[Dict] = None
+    ) -> bool:
         """
         Envoie un message privé au membre à l'origine du déclenchement.
 
@@ -1403,9 +1712,9 @@ class RoutineManager:
     async def _action_play_sound(
         self,
         action: Dict,
-        context: Optional[Dict],
-        routine: Dict
-    ) -> None:
+        context: Optional[Dict] = None,
+        routine: Optional[Dict] = None
+    ) -> bool:
         """
         Exécute une action de lecture de son.
         
@@ -1469,7 +1778,10 @@ class RoutineManager:
 
         # Jouer le son
         player = self.bot.player_manager.get_player(int(guild_id))
-        player.add_to_queue(file_path, "Routine", sound_name, channel)
+        player.add_to_queue(
+            file_path, "Routine", sound_name, channel,
+            owner_guild_id=sound_data.get('guild_id')
+        )
         logger.info(f"🎵 Son '{sound_name}' ajouté à la queue dans #{channel.name} (routine: {routine['name']})")
 
     async def _resolve_target_channel(
@@ -1528,8 +1840,9 @@ class RoutineManager:
     async def _action_send_message(
         self,
         action: Dict,
-        context: Optional[Dict]
-    ) -> None:
+        context: Optional[Dict] = None,
+        routine: Optional[Dict] = None
+    ) -> bool:
         """
         Exécute une action d'envoi de message.
         
@@ -1592,41 +1905,49 @@ class RoutineManager:
         lhs = parts[0].strip()
         rhs = parts[1].strip()
         
-        # Parser le trigger et les conditions
-        trigger_type, trigger_data, conditions = self._parse_trigger_and_conditions(lhs)
-        
-        # Parser les actions
-        actions = self._parse_actions(rhs)
-        
-        return trigger_type, trigger_data, conditions, actions
-
-    def _parse_trigger_and_conditions(
-        self,
-        lhs: str
-    ) -> Tuple[str, Dict, Optional[Dict]]:
-        """
-        Parse la partie gauche (trigger + conditions).
-        
-        Args:
-            lhs: Partie gauche de la commande
-            
-        Returns:
-            Tuple (trigger_type, trigger_data, conditions)
-        """
-        # Séparer trigger et conditions
+        # Isoler les conditions communes, s'il y en a
+        conditions_part = None
         if " if " in lhs:
-            trigger_part, condition_part = lhs.split(" if ", 1)
+            trigger_part, conditions_part = lhs.split(" if ", 1)
         else:
             trigger_part = lhs
-            condition_part = None
         
-        # Parser le trigger
-        trigger_type, trigger_data = self._parse_trigger(trigger_part)
+        # Plusieurs déclencheurs possibles, séparés par " or "
+        triggers = []
+        for chunk in re.split(r'\s+or\s+', trigger_part.strip()):
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+            t_type, t_data = self._parse_trigger(chunk)
+            triggers.append({"type": t_type, "data": t_data})
         
-        # Parser les conditions
-        conditions = self._parse_conditions(condition_part) if condition_part else None
+        if not triggers:
+            raise ValueError("Aucun déclencheur reconnu.")
         
-        return trigger_type, trigger_data, conditions
+        # Les conditions deviennent des blocs englobants, une par niveau :
+        # `if a and b` équivaut à imbriquer SI a puis SI b.
+        trame = []
+        depth = 0
+        if conditions_part:
+            for condition in self._parse_conditions(conditions_part.strip()):
+                trame.append({
+                    "depth": depth,
+                    "link": "and",
+                    "kind": "if",
+                    "logic": "AND",
+                    "conditions": [condition],
+                })
+                depth += 1
+        
+        for action in self._parse_actions(rhs):
+            trame.append({
+                "depth": depth,
+                "link": "and",
+                "kind": "action",
+                "action": action,
+            })
+        
+        return {"triggers": triggers}, trame
 
     def _parse_trigger(self, trigger_str: str) -> Tuple[str, Dict]:
         """
@@ -1767,7 +2088,7 @@ class RoutineManager:
             return {'interval_min': low, 'interval_max': high}
         return {'interval_seconds': low}
 
-    def _parse_conditions(self, condition_str: str) -> Optional[Dict]:
+    def _parse_conditions(self, condition_str: str) -> List[Dict]:
         """
         Parse une chaîne de conditions.
         
@@ -1775,7 +2096,7 @@ class RoutineManager:
             condition_str: Chaîne de conditions séparées par "and"
             
         Returns:
-            Dictionnaire de conditions ou None
+            Liste de conditions feuilles, dans l'ordre d'écriture
         """
         cond_list = []
         cond_tokens = condition_str.split(" and ")
@@ -1796,134 +2117,63 @@ class RoutineManager:
             key = key.strip().lower()
             val = val.strip()
             
-            # Mapper les clés aux types
-            type_map = {
-                "user": "user_id",
-                "channel": "channel_id",
-                "role": "role_id",
-                "time": "time_range",
-                "date": "date_range",
-                "count": "member_count",
-                "members": "member_count",
-                "chance": "chance",
-                "day": "weekday",
-                "jour": "weekday",
-                "playing": "is_playing"
-            }
-            
-            if key not in type_map:
+            # Le type est résolu dans le catalogue de blocs
+            block = condition_by_alias(key)
+            if block is None:
                 raise ValueError(
                     f"Clé de condition inconnue: {key}. "
-                    f"Utilisez: {', '.join(type_map.keys())}"
+                    f"Utilisez: {', '.join(all_condition_aliases())}"
+                )
+            
+            if op not in block.ops:
+                raise ValueError(
+                    f"Opérateur '{op}' non supporté pour '{key}'. "
+                    f"Utilisez: {', '.join(block.ops)}"
                 )
             
             cond_list.append({
-                "type": type_map[key],
+                "type": block.type,
                 "value": val,
                 "op": op
             })
         
-        # Retourner la structure appropriée
-        if not cond_list:
-            return None
-        elif len(cond_list) == 1:
-            return cond_list[0]
-        else:
-            return {"type": "AND", "sub": cond_list}
+        return cond_list
 
     def _parse_actions(self, actions_str: str) -> List[Dict]:
         """
         Parse une chaîne d'actions.
-        
+
+        Chaque verbe est résolu dans le catalogue de blocs : ajouter une
+        action au catalogue la rend utilisable ici sans rien changer.
+
         Args:
             actions_str: Actions séparées par "then"
-            
+
         Returns:
             Liste de dictionnaires d'actions
         """
-        action_tokens = actions_str.split(" then ")
         actions = []
-        
-        for token in action_tokens:
+
+        for token in actions_str.split(" then "):
             token = token.strip()
+            if not token:
+                continue
+
             parts = token.split(" ", 1)
             verb = parts[0].lower()
             args = parts[1].strip() if len(parts) > 1 else ""
-            
-            if verb == "play":
-                if not args:
-                    raise ValueError("Nom du son manquant après 'play'")
-                actions.append({
-                    "type": "play_sound",
-                    "sound_name": args,
-                    "target_strategy": "active"
-                })
-            elif verb == "wait":
-                if not args:
-                    raise ValueError("Durée manquante après 'wait'")
-                actions.append(self._parse_wait_action(args))
-            elif verb == "msg" or verb == "message":
-                # Format: msg #channel_id message content
-                # ou: msg message content (utilise le channel par défaut)
-                actions.append({
-                    "type": "message",
-                    "content": args,
-                    "channel_id": None  # À définir par l'utilisateur
-                })
-            elif verb == "dm" or verb == "mp":
-                if not args:
-                    raise ValueError("Contenu manquant après 'dm'")
-                actions.append({"type": "dm", "content": args})
-            elif verb in ("stop", "skip", "clear", "leave", "quit", "leave_now"):
-                command = "leave" if verb == "quit" else verb
-                actions.append({"type": "player_control", "command": command})
-            elif verb == "chance":
-                if not args:
-                    raise ValueError("Pourcentage manquant après 'chance' (ex: chance 30%)")
-                try:
-                    percent = float(args.strip().rstrip('%'))
-                except ValueError:
-                    raise ValueError(f"Pourcentage invalide: {args}")
-                if not 0 <= percent <= 100:
-                    raise ValueError("Le pourcentage doit être compris entre 0 et 100.")
-                actions.append({"type": "chance", "percent": percent})
-            elif verb == "volume":
-                if not args:
-                    raise ValueError("Valeur manquante après 'volume' (ex: volume 150)")
-                value = args.strip().lower()
-                if value != "reset":
-                    limit = Config.VOLUME_HARD_LIMIT
-                    if not value.isdigit() or not 0 <= int(value) <= limit:
-                        raise ValueError(
-                            f"Le volume doit être un entier entre 0 et {limit}, ou 'reset'. "
-                            "Le plafond du serveur (/config max_volume) s'applique en plus."
-                        )
-                    value = int(value)
-                actions.append({"type": "volume", "value": value})
-            elif verb == "move":
-                # Format: move <id_salon>  |  move member <id_salon>
-                parts_move = args.split()
-                if not parts_move:
-                    raise ValueError("Salon manquant après 'move'")
-                if parts_move[0].lower() in ("member", "membre", "user"):
-                    if len(parts_move) < 2:
-                        raise ValueError("Salon manquant après 'move member'")
-                    target, channel_id = "member", parts_move[1]
-                else:
-                    target, channel_id = "bot", parts_move[0]
-                channel_id = channel_id.strip("<>#")
-                if not channel_id.isdigit():
-                    raise ValueError(f"ID de salon invalide: {channel_id}")
-                actions.append({"type": "move", "target": target, "channel_id": channel_id})
-            else:
+
+            block = action_by_verb(verb)
+            if block is None or block.parse is None:
                 raise ValueError(
-                    f"Action inconnue: {verb}. Utilisez: "
-                    "play, wait, msg, dm, stop, skip, clear, leave, chance, volume, move"
+                    f"Action inconnue: {verb}. "
+                    f"Utilisez: {', '.join(all_action_verbs())}"
                 )
-        
+
+            actions.append(block.parse(verb, args))
+
         return actions
 
-    @staticmethod
     def _parse_wait_action(duration_str: str) -> Dict:
         """
         Construit une action wait, fixe ou aléatoire.
