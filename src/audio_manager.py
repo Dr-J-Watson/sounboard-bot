@@ -11,11 +11,11 @@ Auteur: Soundboard Bot
 import os
 import logging
 import shutil
-import uuid
 from typing import Optional
 from mutagen import File as MutagenFile
 
 from config import Config
+import sound_files
 
 logger = logging.getLogger(__name__)
 
@@ -141,7 +141,13 @@ class AudioManager:
             sanitized = sanitized.replace('__', '_')
         return sanitized
 
-    async def save_upload(self, attachment, filename: str, guild_id: str) -> str:
+    async def save_upload(
+        self,
+        attachment,
+        filename: str,
+        guild_id: str,
+        sound_name: Optional[str] = None
+    ) -> str:
         """
         Sauvegarde une pièce jointe Discord dans le dossier sounds du serveur.
         
@@ -155,6 +161,8 @@ class AudioManager:
             attachment: Objet Attachment Discord (pièce jointe)
             filename: Nom de fichier original
             guild_id: ID du serveur Discord ou "global"
+            sound_name: Nom d'affichage du son, utilisé comme préfixe du
+                fichier. Le nom du fichier d'origine sert de repli.
             
         Returns:
             Chemin complet du fichier sauvegardé
@@ -183,12 +191,15 @@ class AudioManager:
         guild_sounds_dir = os.path.join(Config.SOUNDS_DIR, str(guild_id))
         os.makedirs(guild_sounds_dir, exist_ok=True)
 
-        # Générer un UUID pour le nom de fichier (seul le nom d'affichage sera modifiable)
-        uuid_filename = f"{uuid.uuid4().hex}{file_ext}"
+        # Nom de fichier `nom_uuid.ext` : le préfixe rend le fichier
+        # identifiable sur le disque, l'UUID le rattache durablement à la
+        # base et survit aux renommages.
+        prefix = sound_name or os.path.splitext(filename)[0]
+        stored_filename = sound_files.build_filename(prefix, file_ext)
         
         # Chemins temporaire et final
-        temp_path = os.path.join(guild_sounds_dir, f"temp_{uuid_filename}")
-        final_path = os.path.join(guild_sounds_dir, uuid_filename)
+        temp_path = os.path.join(guild_sounds_dir, f"temp_{stored_filename}")
+        final_path = os.path.join(guild_sounds_dir, stored_filename)
 
         try:
             # Télécharger le fichier temporairement

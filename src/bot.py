@@ -1133,7 +1133,8 @@ async def add_sound(
         saved_path = await audio_manager.save_upload(
             attachment,
             attachment.filename,
-            str(interaction.guild_id)
+            str(interaction.guild_id),
+            sound_name=name
         )
         filename = os.path.basename(saved_path)
         
@@ -2397,7 +2398,9 @@ async def owner_add(interaction: discord.Interaction, scope: str, sound_name: st
         return
 
     try:
-        saved_path = await audio_manager.save_upload(attachment, attachment.filename, target_id)
+        saved_path = await audio_manager.save_upload(
+            attachment, attachment.filename, target_id, sound_name=name
+        )
         filename = os.path.basename(saved_path)
         await db.add_sound(target_id, name, filename, str(interaction.user))
         await interaction.followup.send(f"✅ Son `{name}` ajouté à `{target_id}` !", ephemeral=True)

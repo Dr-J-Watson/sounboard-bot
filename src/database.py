@@ -21,6 +21,7 @@ from contextlib import asynccontextmanager
 import aiosqlite
 
 from config import Config
+import sound_files
 
 logger = logging.getLogger(__name__)
 
@@ -214,74 +215,101 @@ class DatabaseManager:
             await db.commit()
             
         # Migration des fichiers sons vers UUID (hors transaction pour accès fichiers)
-        await self._migrate_sound_files_to_uuid()
+        await self._migrate_sound_filenames()
         
         logger.info("Base de données initialisée avec succès")
 
-    async def _migrate_sound_files_to_uuid(self) -> None:
+    async def _purge_legacy_routines(self) -> int:
         """
-        Migre les fichiers sons existants vers des noms UUID.
-        
-        Cette migration renomme tous les fichiers qui n'ont pas encore
-        un nom UUID pour assurer la rétrocompatibilité.
+        Supprime les routines créées avant le format v2.
+
+        Returns:
+            Nombre de routines supprimées
         """
-        import uuid as uuid_module
-        import re
-        
-        # Pattern pour détecter un UUID hex (32 caractères hex)
-        uuid_pattern = re.compile(r'^[a-f0-9]{32}\.[a-zA-Z0-9]+$')
-        
         async with self._get_connection() as db:
-            # Récupérer tous les sons
-            cursor = await db.execute("SELECT id, guild_id, filename FROM sounds")
+            cursor = await db.execute(
+                "DELETE FROM routines WHERE trigger_type IS NOT 'v2'"
+            )
+            removed = cursor.rowcount
+            await db.commit()
+
+        if removed:
+            logger.warning(
+                f"⚠️ {removed} routine(s) au format antérieur supprimée(s). "
+                "Le nouveau format par blocs n'est pas rétrocompatible : "
+                "elles sont à recréer avec /routine_create."
+            )
+        return removed
+
+    async def _migrate_sound_filenames(self) -> None:
+        """
+        Aligne les fichiers existants sur la convention `nom_uuid.ext`.
+
+        Trois cas se présentent :
+        - fichier déjà au bon format, rien à faire ;
+        - fichier au seul format UUID, hérité de l'ancienne convention :
+          son UUID est conservé et le nom d'affichage lui est préfixé ;
+        - fichier au nom libre, déposé à la main : un UUID lui est attribué.
+
+        L'UUID n'est jamais régénéré quand il existe déjà : c'est lui qui
+        relie durablement la ligne en base au fichier sur le disque.
+        """
+        async with self._get_connection() as db:
+            cursor = await db.execute("SELECT id, guild_id, name, filename FROM sounds")
             sounds = await cursor.fetchall()
             await cursor.close()
-            
-            migrated_count = 0
-            
+
+            renamed = 0
+            adopted = 0
+
             for sound in sounds:
                 old_filename = sound['filename']
-                guild_id = sound['guild_id']
-                sound_id = sound['id']
-                
-                # Vérifier si le fichier a déjà un nom UUID
-                if uuid_pattern.match(old_filename):
+
+                if sound_files.is_current_format(old_filename):
                     continue
-                
-                # Construire les chemins
-                guild_sounds_dir = os.path.join(Config.SOUNDS_DIR, guild_id)
-                old_path = os.path.join(guild_sounds_dir, old_filename)
-                
+
+                guild_dir = os.path.join(Config.SOUNDS_DIR, sound['guild_id'])
+                old_path = os.path.join(guild_dir, old_filename)
+
                 if not os.path.exists(old_path):
-                    logger.warning(f"Fichier introuvable pour migration: {old_path}")
+                    logger.warning(
+                        f"Fichier introuvable, migration ignorée: {old_path}"
+                    )
                     continue
-                
-                # Générer un nouveau nom UUID
-                file_ext = os.path.splitext(old_filename)[1].lower()
-                new_filename = f"{uuid_module.uuid4().hex}{file_ext}"
-                new_path = os.path.join(guild_sounds_dir, new_filename)
-                
+
+                # L'UUID existant est réutilisé s'il y en a un
+                new_filename = sound_files.rename_for(old_filename, sound['name'])
+                new_path = os.path.join(guild_dir, new_filename)
+
+                if os.path.exists(new_path):
+                    logger.warning(
+                        f"Nom déjà pris, migration ignorée: {new_filename}"
+                    )
+                    continue
+
                 try:
-                    # Renommer le fichier
                     os.rename(old_path, new_path)
-                    
-                    # Mettre à jour la base de données
                     await db.execute(
                         "UPDATE sounds SET filename = ? WHERE id = ?",
-                        (new_filename, sound_id)
+                        (new_filename, sound['id'])
                     )
-                    
-                    migrated_count += 1
-                    logger.debug(f"Fichier migré: {old_filename} -> {new_filename}")
-                    
-                except OSError as e:
-                    logger.error(f"Erreur lors de la migration de {old_filename}: {e}")
-            
-            if migrated_count > 0:
-                await db.commit()
-                logger.info(f"Migration UUID: {migrated_count} fichier(s) renommé(s)")
 
-    # ==================== Configuration ====================
+                    if sound_files.extract_uuid(old_filename):
+                        renamed += 1
+                    else:
+                        adopted += 1
+
+                    logger.debug(f"Migré: {old_filename} -> {new_filename}")
+
+                except OSError as e:
+                    logger.error(f"Migration impossible pour {old_filename}: {e}")
+
+            if renamed or adopted:
+                await db.commit()
+                logger.info(
+                    f"Nommage des fichiers: {renamed} fichier(s) UUID préfixé(s), "
+                    f"{adopted} fichier(s) doté(s) d'un UUID"
+                )
 
     async def get_config(self, guild_id: str, key: str, default: Any = None) -> Any:
         """
@@ -486,31 +514,68 @@ class DatabaseManager:
 
     async def rename_sound(self, guild_id: str, old_name: str, new_name: str) -> bool:
         """
-        Renomme un son.
-        
+        Renomme un son, en base et sur le disque.
+
+        Le fichier est renommé pour refléter le nouveau nom, mais son UUID
+        est conservé : le lien entre la base et le fichier ne dépend jamais
+        du nom d'affichage.
+
         Args:
             guild_id: ID du serveur ou "global"
             old_name: Ancien nom du son
             new_name: Nouveau nom du son
-            
+
         Returns:
             True si le renommage a réussi, False sinon
         """
         async with self._get_connection() as db:
-            # Vérifier que le nouveau nom n'existe pas déjà
             cursor = await db.execute(
                 "SELECT 1 FROM sounds WHERE guild_id = ? AND name = ?",
                 (str(guild_id), new_name.lower())
             )
             if await cursor.fetchone():
                 await cursor.close()
-                return False  # Le nom existe déjà
+                return False  # Le nom est déjà pris
             await cursor.close()
-            
-            # Renommer le son
+
+            cursor = await db.execute(
+                "SELECT id, filename FROM sounds WHERE guild_id = ? AND name = ?",
+                (str(guild_id), old_name.lower())
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+
+            if row is None:
+                return False
+
+            old_filename = row['filename']
+            new_filename = sound_files.rename_for(old_filename, new_name)
+
+            # Renommer le fichier, sans faire échouer l'opération si le
+            # disque résiste : la base reste la référence.
+            if new_filename != old_filename:
+                guild_dir = os.path.join(Config.SOUNDS_DIR, str(guild_id))
+                old_path = os.path.join(guild_dir, old_filename)
+                new_path = os.path.join(guild_dir, new_filename)
+
+                if os.path.exists(new_path):
+                    logger.warning(
+                        f"Fichier déjà présent, nom de fichier inchangé: {new_filename}"
+                    )
+                    new_filename = old_filename
+                elif os.path.exists(old_path):
+                    try:
+                        os.rename(old_path, new_path)
+                    except OSError as e:
+                        logger.error(f"Renommage du fichier impossible: {e}")
+                        new_filename = old_filename
+                else:
+                    logger.warning(f"Fichier absent du disque: {old_path}")
+                    new_filename = old_filename
+
             await db.execute(
-                "UPDATE sounds SET name = ? WHERE guild_id = ? AND name = ?",
-                (new_name.lower(), str(guild_id), old_name.lower())
+                "UPDATE sounds SET name = ?, filename = ? WHERE id = ?",
+                (new_name.lower(), new_filename, row['id'])
             )
             await db.commit()
             return True
@@ -519,9 +584,10 @@ class DatabaseManager:
         """
         Synchronise la base de données avec les fichiers présents dans un dossier.
         
-        Ajoute les fichiers audio présents sur le disque mais absents de la DB.
-        Note: Les fichiers sont maintenant stockés avec des noms UUID, donc on
-        vérifie par filename plutôt que par nom d'affichage.
+        Ajoute les fichiers audio présents sur le disque mais absents de la
+        base, et les renomme au format `nom_uuid.ext`. La comparaison se fait
+        sur le nom de fichier, jamais sur le nom d'affichage, qui lui peut
+        changer.
         
         Args:
             guild_id: ID du serveur ou "global"
@@ -560,8 +626,6 @@ class DatabaseManager:
         # (Auparavant list_sounds() était rappelé pour chaque fichier.)
         taken_names = set(await self.list_sounds(guild_id))
         
-        import re
-        uuid_pattern = re.compile(r'^[a-f0-9]{32}\.[a-zA-Z0-9]+$')
         
         added_count = 0
         for filename in audio_files:
@@ -569,13 +633,8 @@ class DatabaseManager:
             if filename in existing_filenames:
                 continue
             
-            # Générer le nom d'affichage à partir du fichier
-            # Si c'est un UUID, utiliser un nom par défaut
-            if uuid_pattern.match(filename):
-                # Fichier orphelin avec nom UUID - générer un nom
-                name = f"son_{filename[:8]}"
-            else:
-                name = os.path.splitext(filename)[0].lower().replace(" ", "_")
+            # Le nom d'affichage se déduit du fichier, selon la convention
+            name = sound_files.display_name_from_filename(filename)
             
             # Vérifier que le nom n'existe pas déjà, sinon ajouter un suffixe
             original_name = name
@@ -584,7 +643,21 @@ class DatabaseManager:
                 name = f"{original_name}_{counter}"
                 counter += 1
             
-            await self.add_sound(guild_id, name, filename, "System Sync")
+            # Aligner tout de suite le fichier sur la convention, plutôt que
+            # d'attendre le prochain démarrage
+            stored_filename = filename
+            if not sound_files.is_current_format(filename):
+                candidate = sound_files.rename_for(filename, name)
+                try:
+                    os.rename(
+                        os.path.join(folder_path, filename),
+                        os.path.join(folder_path, candidate)
+                    )
+                    stored_filename = candidate
+                except OSError as e:
+                    logger.warning(f"Renommage impossible pour {filename}: {e}")
+            
+            await self.add_sound(guild_id, name, stored_filename, "System Sync")
             taken_names.add(name)
             added_count += 1
         
