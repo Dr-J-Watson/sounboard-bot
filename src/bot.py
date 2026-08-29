@@ -353,6 +353,30 @@ class SoundboardBot(commands.Bot):
         await super().close()
 
 
+def build_test_embed(name: str, trace: list) -> discord.Embed:
+    """
+    Met en forme le déroulé d'un test de routine.
+
+    Args:
+        name: Nom de la routine testée
+        trace: Étapes renvoyées par RoutineManager.test_routine
+
+    Returns:
+        L'embed à envoyer
+    """
+    body = "\n".join(trace)
+    if len(body) > 3900:
+        body = body[:3890] + "\n…"
+
+    return discord.Embed(
+        title=f"🧪 Test : {name}",
+        description=body,
+        color=discord.Color.blurple()
+    ).set_footer(
+        text="Les déclencheurs sont ignorés : seule la trame est exécutée."
+    )
+
+
 def render_flat_trame(flat: list, limit: int = 1000) -> str:
     """
     Rend une trame stockée à plat sous forme de liste indentée.
@@ -580,6 +604,8 @@ HELP_SECTIONS = {
             (
                 "Gérer",
                 "`/routine_list` — liste des routines *(accessible à tous)*\n"
+                "`/routine_test <id>` — l'exécute tout de suite et montre "
+                "quelles conditions ont été satisfaites\n"
                 "`/routine_manage` — panel : modifier, activer, supprimer\n"
                 "`/routine_toggle <id>` — active ou désactive\n"
                 "`/routine_delete <id>` — supprime",
@@ -605,7 +631,9 @@ HELP_SECTIONS = {
                 "**🧩 Ajouter** : deux menus, un pour les conditions, un pour "
                 "les actions. Le bloc choisi se pose au bout de la trame.\n"
                 "**🧵 Organiser** : déplacer, imbriquer (`➡️`), sortir (`⬅️`), "
-                "et `🔀 ET/OU` pour le « sinon si ».",
+                "et `🔀 ET/OU` pour le « sinon si ».\n"
+                "**🧪 Tester** exécute la trame sur-le-champ, même non "
+                "enregistrée, et détaille chaque bloc.",
                 False
             ),
         ],
@@ -1758,6 +1786,41 @@ async def routine_delete(interaction: discord.Interaction, routine_id: int) -> N
         )
 
 
+@bot.tree.command(
+    name="routine_test",
+    description="Exécute une routine tout de suite, sans attendre son déclencheur."
+)
+@app_commands.describe(routine_id="ID de la routine, visible avec /routine_list")
+async def routine_test(interaction: discord.Interaction, routine_id: int) -> None:
+    """Joue la trame d'une routine à la demande, et affiche son déroulé."""
+    if not interaction.guild_id:
+        await interaction.response.send_message(
+            "❌ Commande serveur uniquement.", ephemeral=True)
+        return
+
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message(
+            "🚫 Réservé aux administrateurs.", ephemeral=True)
+        return
+
+    routine = await db.get_routine_by_id(routine_id, str(interaction.guild_id))
+    if routine is None:
+        await interaction.response.send_message(
+            f"❌ Aucune routine d'ID `{routine_id}` sur ce serveur.",
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    trace = await bot.routine_manager.test_routine(
+        routine, interaction.guild, interaction.user
+    )
+    await interaction.followup.send(
+        embed=build_test_embed(routine['name'], trace), ephemeral=True
+    )
+
+
 @bot.tree.command(name="routine_toggle", description="Active/Désactive une routine.")
 @app_commands.describe(routine_id="La routine à basculer")
 @app_commands.autocomplete(routine_id=routine_autocomplete)
@@ -2282,6 +2345,44 @@ class RoutinePanelView(discord.ui.View):
         self.selected_routine_id = None
         await self.refresh_view(interaction)
 
+    @discord.ui.button(label="Tester", style=discord.ButtonStyle.success, emoji="🧪", disabled=True, custom_id="test_btn")
+    async def test_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Joue la trame immédiatement, en ignorant les déclencheurs."""
+        if not self.selected_routine_id:
+            return
+
+        routine = await self.db.get_routine_by_id(
+            self.selected_routine_id, str(self.guild_id)
+        )
+        if routine is None:
+            await interaction.response.send_message(
+                "❌ Routine introuvable, elle a peut-être été supprimée.",
+                ephemeral=True
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        trace = await self.bot.routine_manager.test_routine(
+            routine, interaction.guild, interaction.user
+        )
+        await interaction.followup.send(
+            embed=build_test_embed(routine['name'], trace), ephemeral=True
+        )
+
+    @discord.ui.button(label="Nouvelle routine", style=discord.ButtonStyle.primary, emoji="➕", custom_id="new_btn")
+    async def new_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Ouvre l'assistant de création sans passer par /routine_create."""
+        view = RoutineCreationView(self.bot, self.db, self.guild_id)
+        await interaction.response.send_message(
+            embed=discord.Embed(
+                title="🛠️ Nouvelle Routine",
+                description="Commencez par ajouter un déclencheur.",
+                color=discord.Color.blue()
+            ),
+            view=view,
+            ephemeral=True
+        )
+
     @discord.ui.button(label="Rafraîchir", style=discord.ButtonStyle.secondary, custom_id="refresh_btn")
     async def refresh_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.refresh_view(interaction)
@@ -2293,6 +2394,7 @@ class RoutinePanelView(discord.ui.View):
         toggle_btn = [x for x in self.children if isinstance(x, discord.ui.Button) and x.custom_id == "toggle_btn"][0]
         edit_btn = [x for x in self.children if isinstance(x, discord.ui.Button) and x.custom_id == "edit_btn"][0]
         delete_btn = [x for x in self.children if isinstance(x, discord.ui.Button) and x.custom_id == "delete_btn"][0]
+        test_btn = [x for x in self.children if isinstance(x, discord.ui.Button) and x.custom_id == "test_btn"][0]
         
         if not routines:
             select.options = [discord.SelectOption(label="Aucune routine", value="none")]
@@ -2300,7 +2402,13 @@ class RoutinePanelView(discord.ui.View):
             toggle_btn.disabled = True
             edit_btn.disabled = True
             delete_btn.disabled = True
-            embed = discord.Embed(title="Gestion des Routines", description="Aucune routine configurée.", color=discord.Color.orange())
+            test_btn.disabled = True
+            embed = discord.Embed(
+                title="Gestion des Routines",
+                description="Aucune routine configurée.\n"
+                            "Utilisez **➕ Nouvelle routine** pour en créer une.",
+                color=discord.Color.orange()
+            )
         else:
             options = []
             selected_routine = None
@@ -2317,6 +2425,7 @@ class RoutinePanelView(discord.ui.View):
                 toggle_btn.disabled = False
                 edit_btn.disabled = False
                 delete_btn.disabled = False
+                test_btn.disabled = False
                 
                 # Build detail embed
                 status = "✅ Activée" if selected_routine['active'] else "❌ Désactivée"
@@ -2345,6 +2454,7 @@ class RoutinePanelView(discord.ui.View):
                 toggle_btn.disabled = True
                 edit_btn.disabled = True
                 delete_btn.disabled = True
+                test_btn.disabled = True
                 embed = discord.Embed(title="Gestion des Routines", description="Sélectionnez une routine pour voir les détails.", color=discord.Color.blue())
 
         if interaction.response.is_done():
@@ -3348,6 +3458,13 @@ class RoutineCreationView(discord.ui.View):
                 custom_id=custom_id, emoji=emoji, row=row
             ))
 
+        # Cette barre est au maximum des 5 composants par ligne : ajouter
+        # une section imposerait de repenser la disposition.
+        self.add_item(discord.ui.Button(
+            label="Tester", style=discord.ButtonStyle.secondary,
+            custom_id="test", emoji="🧪", row=row,
+            disabled=not self.trame
+        ))
         self.add_item(discord.ui.Button(
             label="Sauvegarder", style=discord.ButtonStyle.success,
             custom_id="save", emoji="💾", row=row,
@@ -3364,6 +3481,11 @@ class RoutineCreationView(discord.ui.View):
             self.add_item(discord.ui.Button(label="Ajouter un bloc", style=discord.ButtonStyle.primary, custom_id="menu_blocks", emoji="🧩", row=0))
             self.add_item(discord.ui.Button(label="Organiser", style=discord.ButtonStyle.primary, custom_id="menu_trame", emoji="🧵", row=0))
 
+            self.add_item(discord.ui.Button(
+                label="Tester", style=discord.ButtonStyle.secondary,
+                custom_id="test", emoji="🧪", row=1,
+                disabled=not self.trame
+            ))
             self.add_item(discord.ui.Button(
                 label="Enregistré" if self.saved else "Sauvegarder",
                 style=discord.ButtonStyle.success,
@@ -3620,6 +3742,9 @@ class RoutineCreationView(discord.ui.View):
             return False
         elif cid == "save":
             await self.save_routine(interaction)
+            return False
+        elif cid == "test":
+            await self.test_current(interaction)
             return False
         elif cid == "set_name":
             await interaction.response.send_modal(NameInputModal(self))
@@ -4063,6 +4188,37 @@ class RoutineCreationView(discord.ui.View):
     # ------------------------------------------------------------------
     # Sauvegarde
     # ------------------------------------------------------------------
+
+    async def test_current(self, interaction: discord.Interaction):
+        """
+        Exécute la trame en cours d'édition, sans l'enregistrer.
+
+        Args:
+            interaction: Interaction du bouton
+        """
+        if not self.trame:
+            await interaction.response.send_message(
+                "❌ Ajoutez au moins un bloc avant de tester.", ephemeral=True
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        routine = {
+            "id": self.routine_id or 0,
+            "guild_id": str(self.guild_id),
+            "name": self.name,
+            "trigger_type": "v2",
+            "trigger_data": {"triggers": self.triggers},
+            "actions": self.build_flat_trame(),
+        }
+
+        trace = await self.bot.routine_manager.test_routine(
+            routine, interaction.guild, interaction.user
+        )
+        await interaction.followup.send(
+            embed=build_test_embed(self.name, trace), ephemeral=True
+        )
 
     async def save_routine(self, interaction: discord.Interaction):
         """

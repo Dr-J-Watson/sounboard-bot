@@ -1267,7 +1267,8 @@ class RoutineManager:
     async def _execute_actions(
         self,
         routine: Dict,
-        context: Optional[RoutineContext]
+        context: Optional[RoutineContext],
+        trace: Optional[List[str]] = None
     ) -> None:
         """
         Exécute la trame d'une routine.
@@ -1275,6 +1276,7 @@ class RoutineManager:
         Args:
             routine: Données de la routine
             context: Contexte d'exécution
+            trace: Liste où consigner le déroulé, pour le mode test
         """
         flat = routine.get('actions') or []
         tree = self.build_tree(flat)
@@ -1284,14 +1286,15 @@ class RoutineManager:
             f"({len(flat)} bloc(s))"
         )
 
-        await self._execute_nodes(tree, routine, context)
+        await self._execute_nodes(tree, routine, context, trace=trace)
 
     async def _execute_nodes(
         self,
         nodes: List[Dict],
         routine: Dict,
         context: Optional[RoutineContext],
-        depth: int = 0
+        depth: int = 0,
+        trace: Optional[List[str]] = None
     ) -> bool:
         """
         Exécute une suite de blocs de même niveau.
@@ -1305,10 +1308,12 @@ class RoutineManager:
             routine: Routine parente (pour les logs et le contexte)
             context: Contexte d'exécution
             depth: Profondeur courante, pour le garde-fou
+            trace: Liste où consigner le déroulé, pour le mode test
 
         Returns:
             True si la routine doit être interrompue entièrement
         """
+        prefix = "　" * depth
         if depth > self.MAX_TRAME_DEPTH:
             logger.warning(
                 f"Trame de '{routine['name']}' trop imbriquée "
@@ -1321,6 +1326,8 @@ class RoutineManager:
         for node in nodes:
             # Chaînage « ou » : on saute si la branche précédente a déjà pris
             if node.get('link') == 'or' and previous_ran:
+                if trace is not None:
+                    trace.append(f"{prefix}⏭️ *bloc en « ou » ignoré, la branche précédente a pris*")
                 continue
 
             kind = node.get('kind', 'action')
@@ -1332,15 +1339,26 @@ class RoutineManager:
                         f"{'  ' * depth}🤔 Bloc condition -> "
                         f"{'vrai' if matched else 'faux'}"
                     )
+                    if trace is not None:
+                        conditions = node.get('conditions') or []
+                        label = describe_condition(conditions[0]) if conditions else "?"
+                        verdict = "✅ vraie" if matched else "❌ fausse"
+                        trace.append(f"{prefix}🤔 SI {label} → {verdict}")
+
                     if matched:
                         stop = await self._execute_nodes(
-                            node.get('children', []), routine, context, depth + 1
+                            node.get('children', []), routine, context,
+                            depth + 1, trace
                         )
                         if stop:
                             return True
                     previous_ran = matched
                 else:
-                    stop = await self._run_action(node.get('action') or {}, routine, context)
+                    action = node.get('action') or {}
+                    stop = await self._run_action(action, routine, context)
+                    if trace is not None:
+                        suffix = " → 🛑 routine interrompue" if stop else ""
+                        trace.append(f"{prefix}▶️ {describe_action(action)}{suffix}")
                     if stop:
                         return True
                     previous_ran = True
@@ -1350,9 +1368,59 @@ class RoutineManager:
                     f"Erreur dans un bloc de la routine '{routine['name']}': {e}",
                     exc_info=True
                 )
+                if trace is not None:
+                    trace.append(f"{prefix}💥 erreur : {e}")
                 previous_ran = False
 
         return False
+
+    async def test_routine(
+        self,
+        routine: Dict,
+        guild: discord.Guild,
+        member: Optional[discord.Member] = None
+    ) -> List[str]:
+        """
+        Exécute une routine à la demande et rend compte de son déroulé.
+
+        Les déclencheurs sont ignorés : seule la trame est jouée, comme si
+        l'un d'eux venait de se produire. C'est ce qui permet de vérifier
+        une routine sans attendre son heure ni provoquer l'événement.
+
+        Args:
+            routine: Données de la routine
+            guild: Serveur où l'exécuter
+            member: Membre à considérer comme déclencheur. Son salon vocal
+                sert de cible ; à défaut, un contexte est choisi comme pour
+                un déclencheur temporel.
+
+        Returns:
+            La liste des étapes, prête à être affichée
+        """
+        context = None
+
+        if member is not None and getattr(member, 'voice', None) and member.voice.channel:
+            context = RoutineContext(
+                guild=guild, channel=member.voice.channel, member=member
+            )
+        else:
+            context = await self._find_valid_context(routine, guild)
+
+        if context is None:
+            return ["⚠️ Personne n'est connecté en vocal : "
+                    "aucun salon où jouer, la trame n'a pas été exécutée."]
+
+        trace: List[str] = []
+        if member is not None and (context.member is not member):
+            trace.append(
+                f"ℹ️ *Contexte choisi automatiquement : "
+                f"{getattr(context.member, 'display_name', '?')} "
+                f"dans #{getattr(context.channel, 'name', '?')}*"
+            )
+
+        await self._execute_actions(routine, context, trace=trace)
+
+        return trace or ["*Aucun bloc n'a été exécuté.*"]
 
     async def _check_block_conditions(
         self,
