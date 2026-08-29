@@ -426,62 +426,89 @@ class RoutineManager:
             self._spawn_actions(routine, context)
             logger.debug(f"Routine horaire '{routine['name']}' exécutée à {target}")
 
+    @staticmethod
+    def _wanted_ids(routine: Dict, condition_type: str) -> set:
+        """
+        Collecte les identifiants visés par les conditions de la trame.
+
+        Sert à choisir un contexte pertinent : une routine déclenchée par un
+        timer n'a ni membre ni salon d'origine, il faut donc en désigner un.
+        Autant prendre celui que la trame cherche.
+
+        Args:
+            routine: Données de la routine
+            condition_type: Type de condition à examiner (user_id, channel_id)
+
+        Returns:
+            Ensemble des identifiants visés par une égalité
+        """
+        wanted = set()
+
+        for node in routine.get('actions') or []:
+            if node.get('kind') != 'if':
+                continue
+            for condition in node.get('conditions') or []:
+                if condition.get('type') != condition_type:
+                    continue
+                if condition.get('op', '==') != '==':
+                    continue
+                wanted |= {
+                    part.strip()
+                    for part in str(condition.get('value', '')).split(',')
+                    if part.strip()
+                }
+
+        return wanted
+
     async def _find_valid_context(
         self,
         routine: Dict,
         guild: discord.Guild
     ) -> Optional[RoutineContext]:
         """
-        Trouve un contexte valide pour exécuter une routine.
-        
-        Parcourt les salons vocaux pour trouver un membre/channel
-        qui satisfait les conditions de la routine.
-        
+        Choisit un contexte d'exécution pour une routine sans origine.
+
+        Un déclencheur temporel n'est lié ni à un membre ni à un salon : il
+        faut en désigner un pour que les conditions et la lecture aient un
+        point d'ancrage.
+
+        Le tirage est aléatoire parmi les salons occupés, pour ne pas
+        favoriser éternellement le premier salon de la liste. Si la trame
+        vise des membres ou des salons précis, le choix se restreint d'abord
+        à ceux-ci : sans cela, une condition « si c'est le membre X » ne
+        serait presque jamais satisfaite.
+
         Args:
             routine: Données de la routine
             guild: Serveur Discord
-            
-        Returns:
-            RoutineContext si trouvé, None sinon
-        """
-        # Vérifier si la routine a des conditions utilisateur spécifiques
-        has_user_condition = False
-        conditions = routine.get('conditions')
-        if conditions:
-            has_user_condition = self._has_user_condition(conditions)
-        
-        # Parcourir les salons vocaux avec des membres
-        for vc in guild.voice_channels:
-            if not vc.members:
-                continue
-                
-            for member in vc.members:
-                if member.bot:
-                    continue
-                    
-                ctx = RoutineContext(guild=guild, channel=vc, member=member)
-                
-                if await self._check_conditions(routine, ctx):
-                    return ctx
-        
-        # Si pas de condition utilisateur, créer un contexte minimal
-        if not has_user_condition:
-            # Trouver un salon avec des membres pour la lecture audio
-            for vc in guild.voice_channels:
-                if vc.members:
-                    return RoutineContext(guild=guild, channel=vc)
-        
-        return None
 
-    def _has_user_condition(self, conditions: Dict) -> bool:
-        """Vérifie si les conditions contiennent une condition utilisateur."""
-        if conditions.get('type') == 'user_id':
-            return True
-        if conditions.get('type') in ('AND', 'OR', 'XOR'):
-            for sub in conditions.get('sub', []):
-                if self._has_user_condition(sub):
-                    return True
-        return False
+        Returns:
+            Un contexte, ou None si personne n'est en vocal
+        """
+        candidates = [
+            (vc, member)
+            for vc in guild.voice_channels
+            for member in vc.members
+            if not member.bot
+        ]
+
+        if not candidates:
+            return None
+
+        wanted_users = self._wanted_ids(routine, 'user_id')
+        wanted_channels = self._wanted_ids(routine, 'channel_id')
+
+        preferred = [
+            (vc, member)
+            for vc, member in candidates
+            if (not wanted_users or str(member.id) in wanted_users)
+            and (not wanted_channels or str(vc.id) in wanted_channels)
+        ]
+
+        # Si personne ne correspond, on garde un contexte quelconque : la
+        # trame peut avoir d'autres branches, à elle de trancher.
+        channel, member = random.choice(preferred or candidates)
+        return RoutineContext(guild=guild, channel=channel, member=member)
 
     async def on_voice_state_update(
         self,
